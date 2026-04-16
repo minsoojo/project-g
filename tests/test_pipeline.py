@@ -73,6 +73,12 @@ class PipelineTests(unittest.TestCase):
         self.assertGreaterEqual(prediction["confidence"], 0.0)
         self.assertLessEqual(prediction["confidence"], 1.0)
 
+    def test_freeze_encoder_option(self) -> None:
+        model = VideoClassifier(VideoClassifierConfig(hidden_dim=64, use_pretrained=False, freeze_encoder=True))
+
+        self.assertTrue(all(not parameter.requires_grad for parameter in model.encoder.parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in model.classifier.parameters()))
+
     def test_json_and_log_output(self) -> None:
         tmp_path = self._make_tmp_path()
         payload = {"prediction": "real", "confidence": 0.25}

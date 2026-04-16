@@ -20,6 +20,7 @@ def predict_video(
     image_size: tuple[int, int] = (224, 224),
     mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
     std: tuple[float, float, float] = (0.229, 0.224, 0.225),
+    return_xai: bool = False,
 ) -> dict[str, float | str]:
     """Predict whether a single video is real or AI-generated."""
     frames = torch.from_numpy(load_video(video_path))
@@ -27,10 +28,21 @@ def predict_video(
     resized = resize_frames(sampled, image_size)
     normalized = normalize_frames(resized, mean, std).unsqueeze(0).to(device)
     model.eval()
-    logits = model(normalized)
+    if return_xai and hasattr(model, "predict_with_xai"):
+        outputs = model.predict_with_xai(normalized)
+        logits = outputs["logits"]
+    else:
+        outputs = None
+        logits = model(normalized)
     confidence = float(torch.sigmoid(logits).item())
     prediction = "ai_generated" if confidence >= 0.5 else "real"
-    return {"prediction": prediction, "confidence": confidence}
+    payload: dict[str, float | str | list[float]] = {"prediction": prediction, "confidence": confidence}
+    if outputs is not None:
+        frame_importance = outputs["frame_importance"]
+        if isinstance(frame_importance, torch.Tensor):
+            payload["frame_importance"] = [float(value) for value in frame_importance.squeeze(0).detach().cpu().tolist()]
+        payload["xai_method"] = str(outputs["xai_method"])
+    return payload
 
 
 def save_prediction(path: str | Path, payload: dict[str, float | str]) -> Path:

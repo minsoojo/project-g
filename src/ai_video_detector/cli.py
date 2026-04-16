@@ -30,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     train_parser.add_argument("--image-size", type=int, default=224)
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument("--no-pretrained", action="store_true")
+    train_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
+    train_parser.add_argument("--freeze-encoder", action="store_true")
 
     infer_parser = subparsers.add_parser("infer")
     infer_parser.add_argument("--video-path", type=Path, required=True)
@@ -37,6 +39,10 @@ def parse_args() -> argparse.Namespace:
     infer_parser.add_argument("--output-path", type=Path)
     infer_parser.add_argument("--num-frames", type=int, default=16)
     infer_parser.add_argument("--image-size", type=int, default=224)
+    infer_parser.add_argument("--with-xai", action="store_true")
+    infer_parser.add_argument("--no-pretrained", action="store_true")
+    infer_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
+    infer_parser.add_argument("--freeze-encoder", action="store_true")
 
     return parser.parse_args()
 
@@ -49,7 +55,11 @@ def load_manifest(path: Path) -> list[VideoSample]:
 def run_train(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    config = VideoClassifierConfig(use_pretrained=not args.no_pretrained)
+    config = VideoClassifierConfig(
+        encoder_name=args.encoder_name,
+        use_pretrained=not args.no_pretrained,
+        freeze_encoder=args.freeze_encoder,
+    )
     model = VideoClassifier(config).to(device)
     optimizer = build_optimizer(model)
 
@@ -75,7 +85,12 @@ def run_train(args: argparse.Namespace) -> None:
 
 def run_infer(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = VideoClassifier(VideoClassifierConfig(use_pretrained=False)).to(device)
+    config = VideoClassifierConfig(
+        encoder_name=args.encoder_name,
+        use_pretrained=not args.no_pretrained,
+        freeze_encoder=args.freeze_encoder,
+    )
+    model = VideoClassifier(config).to(device)
     state_dict = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(state_dict)
     payload = predict_video(
@@ -84,6 +99,7 @@ def run_infer(args: argparse.Namespace) -> None:
         device=device,
         num_frames=args.num_frames,
         image_size=(args.image_size, args.image_size),
+        return_xai=args.with_xai,
     )
     print(json.dumps(payload))
     if args.output_path:

@@ -1,0 +1,50 @@
+{
+  "dataset_root": "D:\\genVideo-100k\\GenVideo-100K\\extracted",
+  "seed": 42,
+  "val_ratio": 0.1,
+  "supported_extensions": [
+    ".avi",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".npy",
+    ".pt"
+  ],
+  "excluded_sources": [
+    "I2VGEN_XL (.gif not supported by current loader)"
+  ],
+  "sources": {
+    "Real": {
+      "label": 0,
+      "train_count": 27000,
+      "val_count": 3000,
+      "total_count": 30000
+    },
+    "train_pika": {
+      "label": 1,
+      "train_count": 9000,
+      "val_count": 1000,
+      "total_count": 10000
+    },
+    "train_SVD": {
+      "label": 1,
+      "train_count": 9000,
+      "val_count": 1000,
+      "total_count": 10000
+    },
+    "train_VideoCrafter": {
+      "label": 1,
+      "train_count": 9000,
+      "val_count": 1000,
+      "total_count": 10000
+    }
+  },
+  "train_count": 54000,
+  "val_count": 6000,
+  "class_balance": {
+    "train_real": 27000,
+    "train_ai": 27000,
+    "val_real": 3000,
+    "val_ai": 3000
+  }
+}

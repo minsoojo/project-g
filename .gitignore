@@ -1,0 +1,27 @@
+# Python cache / test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local runtime temp directories
+.test_run/
+.tmp_test_outputs/
+tmp_test_outputs_runtime/
+
+# Local logs
+logs/
+
+# Generated experiment artifacts
+outputs/
+
+# Downloaded model assets
+models/
+
+# Local sample inputs
+test_input/
+
+# Generated dataset manifests with machine-local absolute paths
+manifests/train_manifest.json
+manifests/val_manifest.json
+manifests/smoke/train_manifest_smoke.json
+manifests/smoke/val_manifest_smoke.json
