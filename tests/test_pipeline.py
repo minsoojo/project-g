@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader, TensorDataset
 
 from ai_video_detector.data import VideoDataset, VideoSample, load_video, load_video_samples_from_manifest
@@ -39,14 +38,16 @@ class PipelineTests(unittest.TestCase):
     def test_load_video_supports_gif_via_imageio(self) -> None:
         tmp_path = self._make_tmp_path()
         gif_path = tmp_path / "sample.gif"
-        gif_path.write_bytes(b"GIF89a")
-        frames = np.random.randint(0, 255, size=(3, 8, 8, 3), dtype=np.uint8)
+        frames = [
+            Image.fromarray(np.full((8, 8, 3), fill_value=value, dtype=np.uint8), mode="RGB")
+            for value in (0, 64, 128)
+        ]
+        frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=100, loop=0)
 
-        fake_imageio = type("FakeImageIO", (), {"imread": staticmethod(lambda _: frames)})
-        with patch.dict(sys.modules, {"imageio": type("FakeImageIOPackage", (), {"v3": fake_imageio}), "imageio.v3": fake_imageio}):
-            loaded = load_video(gif_path)
+        loaded = load_video(gif_path)
 
-        np.testing.assert_array_equal(loaded, frames)
+        self.assertEqual(loaded.shape, (3, 8, 8, 3))
+        self.assertEqual(int(loaded[1, 0, 0, 0]), 64)
 
     def test_load_video_samples_from_manifest_csv(self) -> None:
         tmp_path = self._make_tmp_path()

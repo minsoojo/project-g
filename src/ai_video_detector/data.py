@@ -9,6 +9,7 @@ from typing import Callable, Iterable
 
 import numpy as np
 import torch
+from PIL import Image, ImageSequence
 from torch.utils.data import Dataset
 
 from .preprocessing import normalize_frames, resize_frames, temporal_sample
@@ -25,7 +26,7 @@ class VideoSample:
 
 
 def load_video(path: str | Path) -> np.ndarray:
-    """Load a video from .npy, .pt, or common video formats."""
+    """Load a video from .npy, .pt, .gif, or common video formats."""
     source = Path(path)
     suffix = source.suffix.lower()
 
@@ -39,13 +40,10 @@ def load_video(path: str | Path) -> np.ndarray:
         return _validate_frames(tensor.numpy())
 
     if suffix == ".gif":
-        return _load_with_imageio(source)
+        return _load_gif(source)
 
     if suffix in {".mp4", ".avi", ".mov", ".mkv"}:
-        try:
-            import cv2  # type: ignore
-        except ImportError:
-            return _load_with_imageio(source)
+        import cv2  # type: ignore
 
         capture = cv2.VideoCapture(str(source))
         frames = []
@@ -59,14 +57,12 @@ def load_video(path: str | Path) -> np.ndarray:
     raise ValueError(f"Unsupported video format: {suffix}")
 
 
-def _load_with_imageio(path: Path) -> np.ndarray:
-    try:
-        import imageio.v3 as iio  # type: ignore
-    except ImportError as exc:
-        raise ImportError(
-            "Video loading requires either opencv-python or imageio[v3]."
-        ) from exc
-    frames = iio.imread(path)
+def _load_gif(path: Path) -> np.ndarray:
+    with Image.open(path) as image:
+        frames = np.stack(
+            [np.asarray(frame.convert("RGB")) for frame in ImageSequence.Iterator(image)],
+            axis=0,
+        )
     return _validate_frames(frames)
 
 
