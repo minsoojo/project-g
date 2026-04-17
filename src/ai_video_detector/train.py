@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Dict, List, Optional, Union
 
 import torch
 from torch import nn
@@ -22,7 +23,7 @@ def train_one_epoch(
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    criterion: nn.Module | None = None,
+    criterion: Optional[nn.Module] = None,
 ) -> float:
     """Run one training epoch and return the mean loss."""
     model.train()
@@ -52,15 +53,15 @@ def evaluate_model(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    criterion: nn.Module | None = None,
-) -> dict[str, float]:
+    criterion: Optional[nn.Module] = None,
+) -> Dict[str, float]:
     """Evaluate the model and return output-spec-compliant metrics."""
     model.eval()
     criterion = criterion or nn.BCEWithLogitsLoss()
     total_loss = 0.0
     sample_count = 0
-    all_logits: list[torch.Tensor] = []
-    all_labels: list[torch.Tensor] = []
+    all_logits: List[torch.Tensor] = []
+    all_labels: List[torch.Tensor] = []
 
     for pixel_values, labels in dataloader:
         pixel_values = pixel_values.to(device)
@@ -84,7 +85,7 @@ def evaluate_model(
     return metrics
 
 
-def make_epoch_summary(epoch: int, train_loss: float, val_metrics: dict[str, float]) -> dict[str, float | int]:
+def make_epoch_summary(epoch: int, train_loss: float, val_metrics: Dict[str, float]) -> Dict[str, Union[float, int]]:
     """Create the exact training output JSON contract."""
     return {
         "epoch": epoch,
@@ -95,7 +96,7 @@ def make_epoch_summary(epoch: int, train_loss: float, val_metrics: dict[str, flo
     }
 
 
-def save_checkpoint(model: nn.Module, path: str | Path) -> Path:
+def save_checkpoint(model: nn.Module, path: Union[str, Path]) -> Path:
     """Save model weights to a .pt file."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -103,6 +104,6 @@ def save_checkpoint(model: nn.Module, path: str | Path) -> Path:
     return target
 
 
-def save_epoch_summary(path: str | Path, summary: dict[str, float | int]) -> Path:
+def save_epoch_summary(path: Union[str, Path], summary: Dict[str, Union[float, int]]) -> Path:
     """Persist training results to JSON."""
     return save_json(path, summary)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Optional
 
 import torch
 from torch.utils.data import DataLoader
@@ -49,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_manifest(path: Path, *, data_root: Path | None = None) -> list[VideoSample]:
+def load_manifest(path: Path, *, data_root: Optional[Path] = None) -> list[VideoSample]:
     if path.suffix.lower() == ".csv":
         return load_video_samples_from_manifest(path, base_dir=data_root)
     payload = json.loads(path.read_text(encoding="utf-8"))

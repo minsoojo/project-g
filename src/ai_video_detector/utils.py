@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Union
 
 import numpy as np
 import torch
@@ -21,14 +21,14 @@ def set_seed(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def ensure_parent(path: str | Path) -> Path:
+def ensure_parent(path: Union[str, Path]) -> Path:
     """Create parent directories for the target path."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     return target
 
 
-def save_json(path: str | Path, payload: dict[str, Any]) -> Path:
+def save_json(path: Union[str, Path], payload: Dict[str, Any]) -> Path:
     """Write a JSON payload with a stable key order."""
     target = ensure_parent(path)
     target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")

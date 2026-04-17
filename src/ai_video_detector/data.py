@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Optional, Union
 
 import numpy as np
 import torch
@@ -14,7 +14,7 @@ from torch.utils.data import Dataset
 
 from .preprocessing import normalize_frames, resize_frames, temporal_sample
 
-VideoLoader = Callable[[str | Path], np.ndarray]
+VideoLoader = Callable[[Union[str, Path]], np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class VideoSample:
     label: int
 
 
-def load_video(path: str | Path) -> np.ndarray:
+def load_video(path: Union[str, Path]) -> np.ndarray:
     """Load a video from .npy, .pt, .gif, or common video formats."""
     source = Path(path)
     suffix = source.suffix.lower()
@@ -67,10 +67,10 @@ def _load_gif(path: Path) -> np.ndarray:
 
 
 def load_video_samples_from_manifest(
-    manifest_path: str | Path,
+    manifest_path: Union[str, Path],
     *,
-    base_dir: str | Path | None = None,
-    split: str | None = None,
+    base_dir: Optional[Union[str, Path]] = None,
+    split: Optional[str] = None,
 ) -> list[VideoSample]:
     """Build ``VideoSample`` items from a CSV manifest.
 
