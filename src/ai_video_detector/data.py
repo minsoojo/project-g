@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Optional, Union
 
 import numpy as np
 import torch
+from PIL import Image, ImageSequence
 from torch.utils.data import Dataset
 
 from .preprocessing import normalize_frames, resize_frames, temporal_sample
 
-VideoLoader = Callable[[str | Path], np.ndarray]
+VideoLoader = Callable[[Union[str, Path]], np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -23,8 +25,8 @@ class VideoSample:
     label: int
 
 
-def load_video(path: str | Path) -> np.ndarray:
-    """Load a video from .npy, .pt, or common video formats."""
+def load_video(path: Union[str, Path]) -> np.ndarray:
+    """Load a video from .npy, .pt, .gif, or common video formats."""
     source = Path(path)
     suffix = source.suffix.lower()
 
@@ -37,18 +39,11 @@ def load_video(path: str | Path) -> np.ndarray:
             raise TypeError("Expected a tensor inside the .pt file")
         return _validate_frames(tensor.numpy())
 
+    if suffix == ".gif":
+        return _load_gif(source)
+
     if suffix in {".mp4", ".avi", ".mov", ".mkv"}:
-        try:
-            import cv2  # type: ignore
-        except ImportError:
-            try:
-                import imageio.v3 as iio  # type: ignore
-            except ImportError as exc:
-                raise ImportError(
-                    "Video loading requires either opencv-python or imageio[v3]."
-                ) from exc
-            frames = iio.imread(source)
-            return _validate_frames(frames)
+        import cv2  # type: ignore
 
         capture = cv2.VideoCapture(str(source))
         frames = []
@@ -60,6 +55,56 @@ def load_video(path: str | Path) -> np.ndarray:
         return _validate_frames(np.asarray(frames))
 
     raise ValueError(f"Unsupported video format: {suffix}")
+
+
+def _load_gif(path: Path) -> np.ndarray:
+    with Image.open(path) as image:
+        frames = np.stack(
+            [np.asarray(frame.convert("RGB")) for frame in ImageSequence.Iterator(image)],
+            axis=0,
+        )
+    return _validate_frames(frames)
+
+
+def load_video_samples_from_manifest(
+    manifest_path: Union[str, Path],
+    *,
+    base_dir: Optional[Union[str, Path]] = None,
+    split: Optional[str] = None,
+) -> list[VideoSample]:
+    """Build ``VideoSample`` items from a CSV manifest.
+
+    Expected columns include ``relative_path`` and ``label``. When ``base_dir`` is
+    provided, relative paths are resolved against it; otherwise they are resolved
+    against the manifest file's parent directory.
+    """
+    manifest = Path(manifest_path)
+    root = Path(base_dir) if base_dir is not None else manifest.parent
+    samples: list[VideoSample] = []
+
+    with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            if not row:
+                continue
+            if split is not None and row.get("split") != split:
+                continue
+            if row.get("status") not in {None, "", "ok"}:
+                continue
+            if row.get("is_zero_byte") == "1":
+                continue
+
+            relative_path = row.get("relative_path")
+            label = row.get("label")
+            if not relative_path or label is None:
+                raise ValueError("Manifest rows must include 'relative_path' and 'label'")
+
+            sample_path = Path(relative_path)
+            if not sample_path.is_absolute():
+                sample_path = root / sample_path
+            samples.append(VideoSample(path=str(sample_path), label=int(label)))
+
+    return samples
 
 
 def _validate_frames(frames: np.ndarray) -> np.ndarray:

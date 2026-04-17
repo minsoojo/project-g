@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Optional
 
 import torch
 from torch.utils.data import DataLoader
 
-from .data import VideoDataset, VideoSample
+from .data import VideoDataset, VideoSample, load_video_samples_from_manifest
 from .infer import predict_video
 from .model import VideoClassifier, VideoClassifierConfig
 from .train import build_optimizer, evaluate_model, make_epoch_summary, save_checkpoint, save_epoch_summary, train_one_epoch
@@ -23,6 +24,8 @@ def parse_args() -> argparse.Namespace:
     train_parser = subparsers.add_parser("train")
     train_parser.add_argument("--train-manifest", type=Path, required=True)
     train_parser.add_argument("--val-manifest", type=Path, required=True)
+    train_parser.add_argument("--train-data-root", type=Path)
+    train_parser.add_argument("--val-data-root", type=Path)
     train_parser.add_argument("--output-dir", type=Path, required=True)
     train_parser.add_argument("--epochs", type=int, default=1)
     train_parser.add_argument("--batch-size", type=int, default=2)
@@ -47,7 +50,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_manifest(path: Path) -> list[VideoSample]:
+def load_manifest(path: Path, *, data_root: Optional[Path] = None) -> list[VideoSample]:
+    if path.suffix.lower() == ".csv":
+        return load_video_samples_from_manifest(path, base_dir=data_root)
     payload = json.loads(path.read_text(encoding="utf-8"))
     return [VideoSample(path=item["path"], label=int(item["label"])) for item in payload]
 
@@ -63,8 +68,8 @@ def run_train(args: argparse.Namespace) -> None:
     model = VideoClassifier(config).to(device)
     optimizer = build_optimizer(model)
 
-    train_samples = load_manifest(args.train_manifest)
-    val_samples = load_manifest(args.val_manifest)
+    train_samples = load_manifest(args.train_manifest, data_root=args.train_data_root)
+    val_samples = load_manifest(args.val_manifest, data_root=args.val_data_root)
     train_dataset = VideoDataset(train_samples, num_frames=args.num_frames, image_size=(args.image_size, args.image_size))
     val_dataset = VideoDataset(val_samples, num_frames=args.num_frames, image_size=(args.image_size, args.image_size))
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)

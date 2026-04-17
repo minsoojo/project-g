@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -27,8 +28,8 @@ class EncoderOutputs:
     """Feature vector and optional explainability artifacts."""
 
     features: torch.Tensor
-    frame_importance: torch.Tensor | None = None
-    attention_map: torch.Tensor | None = None
+    frame_importance: Optional[torch.Tensor] = None
+    attention_map: Optional[torch.Tensor] = None
     xai_method: str = "none"
 
 
@@ -116,7 +117,7 @@ class VideoMAEEncoder(nn.Module):
 class VideoClassifier(nn.Module):
     """VideoMAE encoder plus MLP head for binary classification."""
 
-    def __init__(self, config: VideoClassifierConfig | None = None) -> None:
+    def __init__(self, config: Optional[VideoClassifierConfig] = None) -> None:
         super().__init__()
         self.config = config or VideoClassifierConfig()
         self.encoder = VideoMAEEncoder(self.config)
@@ -135,7 +136,7 @@ class VideoClassifier(nn.Module):
         logits = self.classifier(self.encoder(pixel_values)).squeeze(-1)
         return logits
 
-    def predict_with_xai(self, pixel_values: torch.Tensor) -> dict[str, torch.Tensor | str | None]:
+    def predict_with_xai(self, pixel_values: torch.Tensor) -> Dict[str, Optional[Union[torch.Tensor, str]]]:
         """Return logits plus encoder-side explainability artifacts."""
         encoded = self.encoder.encode(pixel_values, return_attention=True)
         logits = self.classifier(encoded.features).squeeze(-1)
@@ -155,10 +156,10 @@ def _normalize_scores(scores: torch.Tensor) -> torch.Tensor:
 
 
 def _compute_videomae_attention_rollup(
-    attentions: tuple[torch.Tensor, ...] | None,
+    attentions: Optional[Tuple[torch.Tensor, ...]],
     num_frames: int,
     config: object,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     if not attentions:
         return None, None
 

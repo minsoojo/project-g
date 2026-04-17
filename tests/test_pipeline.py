@@ -6,9 +6,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader, TensorDataset
 
-from ai_video_detector.data import VideoDataset, VideoSample
+from ai_video_detector.data import VideoDataset, VideoSample, load_video, load_video_samples_from_manifest
 from ai_video_detector.infer import predict_video
 from ai_video_detector.metrics import compute_classification_metrics
 from ai_video_detector.model import VideoClassifier, VideoClassifierConfig
@@ -33,6 +34,40 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(pixel_values.shape, (4, 3, 8, 8))
         self.assertEqual(label.item(), 1.0)
+
+    def test_load_video_supports_gif_via_imageio(self) -> None:
+        tmp_path = self._make_tmp_path()
+        gif_path = tmp_path / "sample.gif"
+        frames = [
+            Image.fromarray(np.full((8, 8, 3), fill_value=value, dtype=np.uint8), mode="RGB")
+            for value in (0, 64, 128)
+        ]
+        frames[0].save(gif_path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+
+        loaded = load_video(gif_path)
+
+        self.assertEqual(loaded.shape, (3, 8, 8, 3))
+        self.assertEqual(int(loaded[1, 0, 0, 0]), 64)
+
+    def test_load_video_samples_from_manifest_csv(self) -> None:
+        tmp_path = self._make_tmp_path()
+        manifest_path = tmp_path / "manifest_train.csv"
+        manifest_path.write_text(
+            "\n".join(
+                [
+                    "id,split,source,label,label_name,relative_path,ext,index,status,is_zero_byte,note",
+                    "1,train,source_a,1,fake,clips/a.gif,.gif,1,ok,0,",
+                    "2,val,source_b,0,real,clips/b.mp4,.mp4,2,ok,0,",
+                    "3,train,source_c,1,fake,clips/c.gif,.gif,3,missing,0,",
+                    "4,train,source_d,0,real,clips/d.gif,.gif,4,ok,1,",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        samples = load_video_samples_from_manifest(manifest_path, base_dir=tmp_path / "dataset", split="train")
+
+        self.assertEqual(samples, [VideoSample(path=str(tmp_path / "dataset" / "clips" / "a.gif"), label=1)])
 
     def test_metrics_output_keys(self) -> None:
         logits = torch.tensor([-3.0, 2.0, 1.0, -2.0])
