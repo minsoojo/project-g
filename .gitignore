@@ -20,6 +20,12 @@ models/
 # Local sample inputs
 test_input/
 
+# Local python scripts
+scripts/
+
+# Local model outputs
+tmp_test/
+
 # Generated dataset manifests with machine-local absolute paths
 manifests/train_manifest.json
 manifests/val_manifest.json
