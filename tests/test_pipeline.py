@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import io
 import sys
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -52,8 +54,22 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(loaded.shape, (3, 8, 8, 3))
         self.assertEqual(int(loaded[1, 0, 0, 0]), 64)
 
+    def test_load_video_reports_corrupt_gif_path(self) -> None:
+        tmp_path = self._make_tmp_path()
+        gif_path = tmp_path / "broken.gif"
+        gif_path.write_bytes(b"not-a-real-gif")
+
+        with self.assertRaises(OSError) as context:
+            load_video(gif_path)
+
+        self.assertIn(str(gif_path), str(context.exception))
+        self.assertIn("Failed to load GIF", str(context.exception))
+
     def test_load_video_samples_from_manifest_csv(self) -> None:
         tmp_path = self._make_tmp_path()
+        dataset_root = tmp_path / "dataset"
+        (dataset_root / "clips").mkdir(parents=True, exist_ok=True)
+        (dataset_root / "clips" / "a.gif").write_bytes(b"gif-placeholder")
         manifest_path = tmp_path / "manifest_train.csv"
         manifest_path.write_text(
             "\n".join(
@@ -68,12 +84,41 @@ class PipelineTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        samples = load_video_samples_from_manifest(manifest_path, base_dir=tmp_path / "dataset", split="train")
+        samples = load_video_samples_from_manifest(manifest_path, base_dir=dataset_root, split="train")
 
-        self.assertEqual(samples, [VideoSample(path=str(tmp_path / "dataset" / "clips" / "a.gif"), label=1)])
+        self.assertEqual(samples, [VideoSample(path=str(dataset_root / "clips" / "a.gif"), label=1)])
+
+    def test_load_video_samples_from_manifest_skips_missing_files(self) -> None:
+        tmp_path = self._make_tmp_path()
+        dataset_root = tmp_path / "dataset"
+        (dataset_root / "clips").mkdir(parents=True, exist_ok=True)
+        valid_path = dataset_root / "clips" / "a.gif"
+        valid_path.write_bytes(b"gif-placeholder")
+        manifest_path = tmp_path / "manifest_train.csv"
+        manifest_path.write_text(
+            "\n".join(
+                [
+                    "id,split,source,label,label_name,relative_path,ext,index,status,is_zero_byte,note",
+                    "1,train,source_a,1,fake,clips/a.gif,.gif,1,ok,0,",
+                    "2,train,source_b,0,real,clips/missing.gif,.gif,2,ok,0,",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            samples = load_video_samples_from_manifest(manifest_path, base_dir=dataset_root, split="train")
+
+        self.assertEqual(samples, [VideoSample(path=str(valid_path), label=1)])
+        self.assertIn("missing sample", stderr.getvalue())
+        self.assertIn("missing.gif", stderr.getvalue())
 
     def test_cli_load_manifest_filters_csv_by_split(self) -> None:
         tmp_path = self._make_tmp_path()
+        dataset_root = tmp_path / "dataset"
+        (dataset_root / "clips").mkdir(parents=True, exist_ok=True)
+        (dataset_root / "clips" / "b.mp4").write_bytes(b"mp4-placeholder")
         manifest_path = tmp_path / "manifest_train.csv"
         manifest_path.write_text(
             "\n".join(
@@ -86,9 +131,9 @@ class PipelineTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        samples = load_manifest(manifest_path, data_root=tmp_path / "dataset", split="val")
+        samples = load_manifest(manifest_path, data_root=dataset_root, split="val")
 
-        self.assertEqual(samples, [VideoSample(path=str(tmp_path / "dataset" / "clips" / "b.mp4"), label=0)])
+        self.assertEqual(samples, [VideoSample(path=str(dataset_root / "clips" / "b.mp4"), label=0)])
 
     def test_cli_parse_args_accepts_single_manifest_mode(self) -> None:
         argv = [
@@ -106,6 +151,55 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(args.manifest, Path("shared.csv"))
         self.assertEqual(args.train_split, "train")
         self.assertEqual(args.val_split, "val")
+
+    def test_video_dataset_skips_corrupt_sample_and_logs_warning(self) -> None:
+        samples = [
+            VideoSample(path="broken.gif", label=1),
+            VideoSample(path="good.npy", label=0),
+        ]
+        good_frames = np.random.randint(0, 255, size=(4, 8, 8, 3), dtype=np.uint8)
+
+        def loader(path: Path) -> np.ndarray:
+            if str(path) == "broken.gif":
+                raise OSError("Failed to load GIF 'broken.gif': decoder error")
+            return good_frames
+
+        dataset = VideoDataset(samples, num_frames=4, image_size=(8, 8), video_loader=loader)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            pixel_values, label = dataset[0]
+
+        self.assertEqual(pixel_values.shape, (4, 3, 8, 8))
+        self.assertEqual(label.item(), 0.0)
+        self.assertIn("[WARN] failed to load sample", stderr.getvalue())
+        self.assertIn("broken.gif", stderr.getvalue())
+
+    def test_training_pipeline_continues_after_corrupt_sample(self) -> None:
+        set_seed(3)
+        device = torch.device("cpu")
+        model = VideoClassifier(VideoClassifierConfig(hidden_dim=64, use_pretrained=False))
+        optimizer = build_optimizer(model, lr=1e-3)
+        good_frames = np.random.randint(0, 255, size=(4, 8, 8, 3), dtype=np.uint8)
+        samples = [
+            VideoSample(path="broken.gif", label=1),
+            VideoSample(path="good_a.npy", label=0),
+            VideoSample(path="good_b.npy", label=1),
+        ]
+
+        def loader(path: Path) -> np.ndarray:
+            if str(path) == "broken.gif":
+                raise OSError("Failed to load GIF 'broken.gif': decoder error")
+            return good_frames
+
+        dataset = VideoDataset(samples, num_frames=4, image_size=(8, 8), video_loader=loader)
+        dataloader = DataLoader(dataset, batch_size=2, shuffle=False)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            train_loss = train_one_epoch(model, dataloader, optimizer, device, log_interval=1)
+
+        self.assertGreaterEqual(train_loss, 0.0)
+        self.assertIn("broken.gif", stderr.getvalue())
+        self.assertIn("train progress", stderr.getvalue())
 
     def test_metrics_output_keys(self) -> None:
         logits = torch.tensor([-3.0, 2.0, 1.0, -2.0])
