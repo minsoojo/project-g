@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, TensorDataset
 
+from ai_video_detector.cli import load_manifest, parse_args
 from ai_video_detector.data import VideoDataset, VideoSample, load_video, load_video_samples_from_manifest
 from ai_video_detector.infer import predict_video
 from ai_video_detector.metrics import compute_classification_metrics
@@ -68,6 +71,41 @@ class PipelineTests(unittest.TestCase):
         samples = load_video_samples_from_manifest(manifest_path, base_dir=tmp_path / "dataset", split="train")
 
         self.assertEqual(samples, [VideoSample(path=str(tmp_path / "dataset" / "clips" / "a.gif"), label=1)])
+
+    def test_cli_load_manifest_filters_csv_by_split(self) -> None:
+        tmp_path = self._make_tmp_path()
+        manifest_path = tmp_path / "manifest_train.csv"
+        manifest_path.write_text(
+            "\n".join(
+                [
+                    "id,split,source,label,label_name,relative_path,ext,index,status,is_zero_byte,note",
+                    "1,train,source_a,1,fake,clips/a.gif,.gif,1,ok,0,",
+                    "2,val,source_b,0,real,clips/b.mp4,.mp4,2,ok,0,",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        samples = load_manifest(manifest_path, data_root=tmp_path / "dataset", split="val")
+
+        self.assertEqual(samples, [VideoSample(path=str(tmp_path / "dataset" / "clips" / "b.mp4"), label=0)])
+
+    def test_cli_parse_args_accepts_single_manifest_mode(self) -> None:
+        argv = [
+            "ai-video-detector",
+            "train",
+            "--manifest",
+            "shared.csv",
+            "--output-dir",
+            "outputs/run",
+        ]
+
+        with patch.object(sys, "argv", argv):
+            args = parse_args()
+
+        self.assertEqual(args.manifest, Path("shared.csv"))
+        self.assertEqual(args.train_split, "train")
+        self.assertEqual(args.val_split, "val")
 
     def test_metrics_output_keys(self) -> None:
         logits = torch.tensor([-3.0, 2.0, 1.0, -2.0])
