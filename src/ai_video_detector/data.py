@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Union
@@ -46,24 +47,43 @@ def load_video(path: Union[str, Path]) -> np.ndarray:
         import cv2  # type: ignore
 
         capture = cv2.VideoCapture(str(source))
+        if not capture.isOpened():
+            capture.release()
+            raise OSError(f"Failed to load video '{source}': could not open file")
         frames = []
-        success, frame = capture.read()
-        while success:
-            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        try:
             success, frame = capture.read()
-        capture.release()
-        return _validate_frames(np.asarray(frames))
+            while success:
+                if frame is None:
+                    raise ValueError(f"Failed to load video '{source}': decoder returned an empty frame")
+                try:
+                    frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                except Exception as exc:
+                    raise ValueError(f"Failed to load video '{source}': {exc}") from exc
+                success, frame = capture.read()
+        finally:
+            capture.release()
+
+        if not frames:
+            raise ValueError(f"Failed to load video '{source}': decoded 0 frames")
+        try:
+            return _validate_frames(np.asarray(frames))
+        except Exception as exc:
+            raise ValueError(f"Failed to load video '{source}': {exc}") from exc
 
     raise ValueError(f"Unsupported video format: {suffix}")
 
 
 def _load_gif(path: Path) -> np.ndarray:
-    with Image.open(path) as image:
-        frames = np.stack(
-            [np.asarray(frame.convert("RGB")) for frame in ImageSequence.Iterator(image)],
-            axis=0,
-        )
-    return _validate_frames(frames)
+    try:
+        with Image.open(path) as image:
+            frames = np.stack(
+                [np.asarray(frame.convert("RGB")) for frame in ImageSequence.Iterator(image)],
+                axis=0,
+            )
+        return _validate_frames(frames)
+    except Exception as exc:
+        raise OSError(f"Failed to load GIF '{path}': {exc}") from exc
 
 
 def load_video_samples_from_manifest(
@@ -102,6 +122,12 @@ def load_video_samples_from_manifest(
             sample_path = Path(relative_path)
             if not sample_path.is_absolute():
                 sample_path = root / sample_path
+            if not sample_path.exists():
+                print(
+                    f"[WARN] missing sample path={sample_path}",
+                    file=sys.stderr,
+                )
+                continue
             samples.append(VideoSample(path=str(sample_path), label=int(label)))
 
     return samples
@@ -138,11 +164,32 @@ class VideoDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
         return len(self.samples)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        sample = self.samples[index]
-        frames = self.video_loader(sample.path)
-        frame_tensor = torch.from_numpy(frames)
-        sampled = temporal_sample(frame_tensor, self.num_frames)
-        resized = resize_frames(sampled, self.image_size)
-        normalized = normalize_frames(resized, self.mean, self.std)
-        label = torch.tensor(float(sample.label), dtype=torch.float32)
-        return normalized, label
+        if not self.samples:
+            raise IndexError("VideoDataset is empty")
+
+        total_samples = len(self.samples)
+        start_index = index % total_samples
+
+        for offset in range(total_samples):
+            sample = self.samples[(start_index + offset) % total_samples]
+            try:
+                frames = self.video_loader(sample.path)
+                frame_tensor = torch.from_numpy(frames)
+                sampled = temporal_sample(frame_tensor, self.num_frames)
+                resized = resize_frames(sampled, self.image_size)
+                normalized = normalize_frames(resized, self.mean, self.std)
+                label = torch.tensor(float(sample.label), dtype=torch.float32)
+                return normalized, label
+            except Exception as exc:
+                _warn_failed_sample(sample.path, exc)
+
+        raise RuntimeError(
+            f"Failed to load any sample after {total_samples} attempts starting from index {index}."
+        )
+
+
+def _warn_failed_sample(path: Union[str, Path], exc: Exception) -> None:
+    print(
+        f"[WARN] failed to load sample path={path} error={type(exc).__name__}: {exc}",
+        file=sys.stderr,
+    )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -24,6 +25,7 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     criterion: Optional[nn.Module] = None,
+    log_interval: int = 100,
 ) -> float:
     """Run one training epoch and return the mean loss."""
     model.train()
@@ -31,7 +33,7 @@ def train_one_epoch(
     total_loss = 0.0
     sample_count = 0
 
-    for pixel_values, labels in dataloader:
+    for step, (pixel_values, labels) in enumerate(dataloader, start=1):
         pixel_values = pixel_values.to(device)
         labels = labels.to(device)
         optimizer.zero_grad(set_to_none=True)
@@ -44,6 +46,12 @@ def train_one_epoch(
         batch_size = labels.size(0)
         total_loss += loss.item() * batch_size
         sample_count += batch_size
+        if log_interval > 0 and step % log_interval == 0:
+            running_loss = total_loss / max(sample_count, 1)
+            print(
+                f"[INFO] train progress step={step} running_loss={running_loss:.4f}",
+                file=sys.stderr,
+            )
 
     return total_loss / max(sample_count, 1)
 
