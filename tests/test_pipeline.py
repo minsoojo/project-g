@@ -255,6 +255,18 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(loaded, payload)
         self.assertEqual(log_message("info", "message"), "[INFO] message")
 
+    #추가된 테스트
+    def test_xai_output_structure(self):
+        model = VideoClassifier(VideoClassifierConfig(hidden_dim=64, use_pretrained=False))
+        device = torch.device("cpu")
+
+        dummy = torch.randn(1, 4, 3, 8, 8)
+
+        outputs = model.predict_with_xai(dummy)
+
+        self.assertIn("segments", outputs)
+        self.assertIn("explanations", outputs)       
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

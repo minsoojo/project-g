@@ -50,6 +50,9 @@ def parse_args() -> argparse.Namespace:
     infer_parser.add_argument("--no-pretrained", action="store_true")
     infer_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
     infer_parser.add_argument("--freeze-encoder", action="store_true")
+    # XAI 때문에 추가된 부분
+    infer_parser.add_argument("--with-xai", action="store_true")
+    infer_parser.add_argument("--xai-threshold", type=float, default=0.6)
 
     args = parser.parse_args()
     if args.command == "train":

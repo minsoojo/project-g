@@ -23,6 +23,7 @@ class VideoClassifierConfig:
     freeze_encoder: bool = False
 
 
+
 @dataclass
 class EncoderOutputs:
     """Feature vector and optional explainability artifacts."""
@@ -135,15 +136,44 @@ class VideoClassifier(nn.Module):
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         logits = self.classifier(self.encoder(pixel_values)).squeeze(-1)
         return logits
-
-    def predict_with_xai(self, pixel_values: torch.Tensor) -> Dict[str, Optional[Union[torch.Tensor, str]]]:
-        """Return logits plus encoder-side explainability artifacts."""
+    
+    #이 함수를 수정함!
+    
+    def predict_with_xai(self, pixel_values: torch.Tensor) -> Dict:
         encoded = self.encoder.encode(pixel_values, return_attention=True)
         logits = self.classifier(encoded.features).squeeze(-1)
+
+        frame_importance = encoded.frame_importance
+        attention_map = encoded.attention_map
+
+        segments = []
+        explanations = []
+
+        if frame_importance is not None:
+            fi = frame_importance.squeeze(0)
+            segs = extract_segments(fi)
+
+            for seg in segs:
+                anomaly_type = classify_anomaly(fi, attention_map)
+                conf = fi[seg[0]:seg[1]+1].mean().item()
+
+                segments.append({
+                    "start_frame": seg[0],
+                    "end_frame": seg[1],
+                    "type": anomaly_type,
+                    "confidence": conf
+                })
+
+                explanations.append(
+                    generate_explanation(seg, anomaly_type, conf)
+                )
+
         return {
             "logits": logits,
-            "frame_importance": encoded.frame_importance,
-            "attention_map": encoded.attention_map,
+            "frame_importance": frame_importance,
+            "attention_map": attention_map,
+            "segments": segments,
+            "explanations": explanations,
             "xai_method": encoded.xai_method,
         }
 
@@ -191,3 +221,47 @@ def _compute_videomae_attention_rollup(
             align_corners=False,
         ).squeeze(1)
     return frame_importance, attention_map
+
+#XAI로 추가된 부분
+
+def extract_segments(frame_importance: torch.Tensor, threshold: float = 0.6):
+    segments = []
+    current = None
+
+    for i, score in enumerate(frame_importance):
+        if score >= threshold:
+            if current is None:
+                current = [i, i]
+            else:
+                current[1] = i
+        else:
+            if current is not None:
+                segments.append(tuple(current))
+                current = None
+
+    if current is not None:
+        segments.append(tuple(current))
+
+    return segments
+
+
+def classify_anomaly(frame_importance, attention_map):
+    if attention_map is None:
+        return "unknown"
+
+    spatial_var = attention_map.var().item()
+    temporal_var = frame_importance.var().item()
+
+    if temporal_var > 0.1:
+        return "movement anomaly"
+    elif spatial_var > 0.1:
+        return "texture jitter"
+    elif frame_importance.mean().item() > 0.7:
+        return "lighting anomaly"
+    else:
+        return "object inconsistency"
+
+
+def generate_explanation(segment, anomaly_type, confidence):
+    start, end = segment
+    return f"Frames {start} to {end} show {anomaly_type} (confidence {confidence:.2f})"

@@ -29,20 +29,29 @@ def predict_video(
     resized = resize_frames(sampled, image_size)
     normalized = normalize_frames(resized, mean, std).unsqueeze(0).to(device)
     model.eval()
+
+    #이 부분 수정됨
     if return_xai and hasattr(model, "predict_with_xai"):
         outputs = model.predict_with_xai(normalized)
         logits = outputs["logits"]
     else:
         outputs = None
         logits = model(normalized)
+
     confidence = float(torch.sigmoid(logits).item())
     prediction = "ai_generated" if confidence >= 0.5 else "real"
-    payload: Dict[str, Union[float, str, List[float]]] = {"prediction": prediction, "confidence": confidence}
+
+    payload = {
+        "prediction": prediction,
+        "confidence": confidence
+    }
+
     if outputs is not None:
-        frame_importance = outputs["frame_importance"]
-        if isinstance(frame_importance, torch.Tensor):
-            payload["frame_importance"] = [float(value) for value in frame_importance.squeeze(0).detach().cpu().tolist()]
-        payload["xai_method"] = str(outputs["xai_method"])
+        payload["frame_importance"] = outputs.get("frame_importance", None)
+        payload["segments"] = outputs.get("segments", [])
+        payload["explanations"] = outputs.get("explanations", [])
+        payload["xai_method"] = outputs.get("xai_method", "")
+
     return payload
 
 
