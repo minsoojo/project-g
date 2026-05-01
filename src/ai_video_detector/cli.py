@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from .data import VideoDataset, VideoSample, load_video_samples_from_manifest
 from .infer import predict_video
+from .metrics import compute_classification_metrics
 from .model import VideoClassifier, VideoClassifierConfig
 from .train import build_optimizer, evaluate_model, make_epoch_summary, save_checkpoint, save_epoch_summary, train_one_epoch
 from .utils import set_seed
@@ -50,6 +51,20 @@ def parse_args() -> argparse.Namespace:
     infer_parser.add_argument("--no-pretrained", action="store_true")
     infer_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
     infer_parser.add_argument("--freeze-encoder", action="store_true")
+
+    infer_manifest_parser = subparsers.add_parser("infer-manifest")
+    infer_manifest_parser.add_argument("--manifest", type=Path, required=True)
+    infer_manifest_parser.add_argument("--data-root", type=Path)
+    infer_manifest_parser.add_argument("--split", type=str)
+    infer_manifest_parser.add_argument("--checkpoint", type=Path, required=True)
+    infer_manifest_parser.add_argument("--output-path", type=Path, required=True)
+    infer_manifest_parser.add_argument("--num-frames", type=int, default=16)
+    infer_manifest_parser.add_argument("--image-size", type=int, default=224)
+    infer_manifest_parser.add_argument("--limit", type=int)
+    infer_manifest_parser.add_argument("--with-xai", action="store_true")
+    infer_manifest_parser.add_argument("--no-pretrained", action="store_true")
+    infer_manifest_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
+    infer_manifest_parser.add_argument("--freeze-encoder", action="store_true")
 
     args = parser.parse_args()
     if args.command == "train":
@@ -134,6 +149,82 @@ def run_infer(args: argparse.Namespace) -> None:
         args.output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def run_infer_manifest(args: argparse.Namespace) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config = VideoClassifierConfig(
+        encoder_name=args.encoder_name,
+        use_pretrained=not args.no_pretrained,
+        freeze_encoder=args.freeze_encoder,
+    )
+    model = VideoClassifier(config).to(device)
+    state_dict = torch.load(args.checkpoint, map_location=device)
+    model.load_state_dict(state_dict)
+
+    samples = load_manifest(args.manifest, data_root=args.data_root, split=args.split)
+    if args.limit is not None:
+        samples = samples[: args.limit]
+
+    predictions = []
+    confidences = []
+    labels = []
+    failures = []
+    for index, sample in enumerate(samples, start=1):
+        try:
+            prediction = predict_video(
+                model,
+                sample.path,
+                device=device,
+                num_frames=args.num_frames,
+                image_size=(args.image_size, args.image_size),
+                return_xai=args.with_xai,
+            )
+            confidence = float(prediction["confidence"])
+            predictions.append(
+                {
+                    "path": sample.path,
+                    "label": int(sample.label),
+                    **prediction,
+                }
+            )
+            confidences.append(confidence)
+            labels.append(float(sample.label))
+        except Exception as exc:
+            failures.append(
+                {
+                    "path": sample.path,
+                    "label": int(sample.label),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+        if index % 100 == 0:
+            print(
+                f"[INFO] infer progress processed={index} predicted={len(predictions)} failed={len(failures)}",
+                flush=True,
+            )
+
+    metrics = {}
+    if confidences:
+        probs = torch.tensor(confidences, dtype=torch.float32)
+        logits = torch.logit(probs.clamp(1e-6, 1 - 1e-6))
+        label_tensor = torch.tensor(labels, dtype=torch.float32)
+        metrics = compute_classification_metrics(logits, label_tensor)
+
+    payload = {
+        "manifest": str(args.manifest),
+        "split": args.split,
+        "checkpoint": str(args.checkpoint),
+        "num_samples": len(samples),
+        "num_predictions": len(predictions),
+        "num_failures": len(failures),
+        "metrics": metrics,
+        "predictions": predictions,
+        "failures": failures,
+    }
+    args.output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(json.dumps({key: payload[key] for key in ("num_samples", "num_predictions", "num_failures", "metrics")}))
+
+
 def main() -> None:
     args = parse_args()
     if args.command == "train":
@@ -141,6 +232,9 @@ def main() -> None:
         return
     if args.command == "infer":
         run_infer(args)
+        return
+    if args.command == "infer-manifest":
+        run_infer_manifest(args)
         return
     raise ValueError(f"Unsupported command: {args.command}")
 

@@ -152,6 +152,29 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(args.train_split, "train")
         self.assertEqual(args.val_split, "val")
 
+    def test_cli_parse_args_accepts_manifest_inference(self) -> None:
+        argv = [
+            "ai-video-detector",
+            "infer-manifest",
+            "--manifest",
+            "manifest.csv",
+            "--split",
+            "test",
+            "--checkpoint",
+            "runs/head_only_30k/model.pt",
+            "--output-path",
+            "runs/head_only_30k/test_predictions.json",
+        ]
+
+        with patch.object(sys, "argv", argv):
+            args = parse_args()
+
+        self.assertEqual(args.command, "infer-manifest")
+        self.assertEqual(args.manifest, Path("manifest.csv"))
+        self.assertEqual(args.split, "test")
+        self.assertEqual(args.checkpoint, Path("runs/head_only_30k/model.pt"))
+        self.assertEqual(args.output_path, Path("runs/head_only_30k/test_predictions.json"))
+
     def test_video_dataset_skips_corrupt_sample_and_logs_warning(self) -> None:
         samples = [
             VideoSample(path="broken.gif", label=1),
