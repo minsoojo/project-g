@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import Any, Dict, Tuple, Union
 
 import torch
 
@@ -22,7 +22,8 @@ def predict_video(
     mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
     std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
     return_xai: bool = False,
-) -> Dict[str, Union[float, str, List[float]]]:
+    xai_threshold: float = 0.6,
+) -> Dict[str, Any]:
     """Predict whether a single video is real or AI-generated."""
     frames = torch.from_numpy(load_video(video_path))
     sampled = temporal_sample(frames, num_frames)
@@ -30,22 +31,24 @@ def predict_video(
     normalized = normalize_frames(resized, mean, std).unsqueeze(0).to(device)
     model.eval()
     if return_xai and hasattr(model, "predict_with_xai"):
-        outputs = model.predict_with_xai(normalized)
+        outputs = model.predict_with_xai(normalized, threshold=xai_threshold)
         logits = outputs["logits"]
     else:
         outputs = None
         logits = model(normalized)
     confidence = float(torch.sigmoid(logits).item())
     prediction = "ai_generated" if confidence >= 0.5 else "real"
-    payload: Dict[str, Union[float, str, List[float]]] = {"prediction": prediction, "confidence": confidence}
+    payload: Dict[str, Any] = {"prediction": prediction, "confidence": confidence}
     if outputs is not None:
         frame_importance = outputs["frame_importance"]
         if isinstance(frame_importance, torch.Tensor):
             payload["frame_importance"] = [float(value) for value in frame_importance.squeeze(0).detach().cpu().tolist()]
+        payload["segments"] = outputs.get("segments", [])
+        payload["explanations"] = outputs.get("explanations", [])
         payload["xai_method"] = str(outputs["xai_method"])
     return payload
 
 
-def save_prediction(path: Union[str, Path], payload: Dict[str, Union[float, str, List[float]]]) -> Path:
+def save_prediction(path: Union[str, Path], payload: Dict[str, Any]) -> Path:
     """Persist inference results to JSON."""
     return save_json(path, payload)

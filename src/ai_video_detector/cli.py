@@ -40,6 +40,10 @@ def parse_args() -> argparse.Namespace:
     train_parser.add_argument("--no-pretrained", action="store_true")
     train_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
     train_parser.add_argument("--freeze-encoder", action="store_true")
+    train_parser.add_argument("--head-type", choices=("mlp", "transformer"), default="mlp")
+    train_parser.add_argument("--transformer-head-layers", type=int, default=2)
+    train_parser.add_argument("--transformer-head-heads", type=int, default=8)
+    train_parser.add_argument("--transformer-head-ff-dim", type=int, default=2048)
 
     infer_parser = subparsers.add_parser("infer")
     infer_parser.add_argument("--video-path", type=Path, required=True)
@@ -48,9 +52,14 @@ def parse_args() -> argparse.Namespace:
     infer_parser.add_argument("--num-frames", type=int, default=16)
     infer_parser.add_argument("--image-size", type=int, default=224)
     infer_parser.add_argument("--with-xai", action="store_true")
+    infer_parser.add_argument("--xai-threshold", type=float, default=0.6)
     infer_parser.add_argument("--no-pretrained", action="store_true")
     infer_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
     infer_parser.add_argument("--freeze-encoder", action="store_true")
+    infer_parser.add_argument("--head-type", choices=("mlp", "transformer"), default="mlp")
+    infer_parser.add_argument("--transformer-head-layers", type=int, default=2)
+    infer_parser.add_argument("--transformer-head-heads", type=int, default=8)
+    infer_parser.add_argument("--transformer-head-ff-dim", type=int, default=2048)
 
     infer_manifest_parser = subparsers.add_parser("infer-manifest")
     infer_manifest_parser.add_argument("--manifest", type=Path, required=True)
@@ -62,9 +71,14 @@ def parse_args() -> argparse.Namespace:
     infer_manifest_parser.add_argument("--image-size", type=int, default=224)
     infer_manifest_parser.add_argument("--limit", type=int)
     infer_manifest_parser.add_argument("--with-xai", action="store_true")
+    infer_manifest_parser.add_argument("--xai-threshold", type=float, default=0.6)
     infer_manifest_parser.add_argument("--no-pretrained", action="store_true")
     infer_manifest_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
     infer_manifest_parser.add_argument("--freeze-encoder", action="store_true")
+    infer_manifest_parser.add_argument("--head-type", choices=("mlp", "transformer"), default="mlp")
+    infer_manifest_parser.add_argument("--transformer-head-layers", type=int, default=2)
+    infer_manifest_parser.add_argument("--transformer-head-heads", type=int, default=8)
+    infer_manifest_parser.add_argument("--transformer-head-ff-dim", type=int, default=2048)
 
     args = parser.parse_args()
     if args.command == "train":
@@ -91,6 +105,10 @@ def run_train(args: argparse.Namespace) -> None:
         encoder_name=args.encoder_name,
         use_pretrained=not args.no_pretrained,
         freeze_encoder=args.freeze_encoder,
+        head_type=args.head_type,
+        transformer_head_layers=args.transformer_head_layers,
+        transformer_head_heads=args.transformer_head_heads,
+        transformer_head_ff_dim=args.transformer_head_ff_dim,
     )
     model = VideoClassifier(config).to(device)
     optimizer = build_optimizer(model)
@@ -132,6 +150,10 @@ def run_infer(args: argparse.Namespace) -> None:
         encoder_name=args.encoder_name,
         use_pretrained=not args.no_pretrained,
         freeze_encoder=args.freeze_encoder,
+        head_type=args.head_type,
+        transformer_head_layers=args.transformer_head_layers,
+        transformer_head_heads=args.transformer_head_heads,
+        transformer_head_ff_dim=args.transformer_head_ff_dim,
     )
     model = VideoClassifier(config).to(device)
     state_dict = torch.load(args.checkpoint, map_location=device)
@@ -143,6 +165,7 @@ def run_infer(args: argparse.Namespace) -> None:
         num_frames=args.num_frames,
         image_size=(args.image_size, args.image_size),
         return_xai=args.with_xai,
+        xai_threshold=args.xai_threshold,
     )
     print(json.dumps(payload))
     if args.output_path:
@@ -155,6 +178,10 @@ def run_infer_manifest(args: argparse.Namespace) -> None:
         encoder_name=args.encoder_name,
         use_pretrained=not args.no_pretrained,
         freeze_encoder=args.freeze_encoder,
+        head_type=args.head_type,
+        transformer_head_layers=args.transformer_head_layers,
+        transformer_head_heads=args.transformer_head_heads,
+        transformer_head_ff_dim=args.transformer_head_ff_dim,
     )
     model = VideoClassifier(config).to(device)
     state_dict = torch.load(args.checkpoint, map_location=device)
@@ -177,6 +204,7 @@ def run_infer_manifest(args: argparse.Namespace) -> None:
                 num_frames=args.num_frames,
                 image_size=(args.image_size, args.image_size),
                 return_xai=args.with_xai,
+                xai_threshold=args.xai_threshold,
             )
             confidence = float(prediction["confidence"])
             predictions.append(

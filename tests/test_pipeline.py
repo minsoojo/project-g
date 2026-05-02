@@ -164,6 +164,9 @@ class PipelineTests(unittest.TestCase):
             "runs/head_only_30k/model.pt",
             "--output-path",
             "runs/head_only_30k/test_predictions.json",
+            "--with-xai",
+            "--xai-threshold",
+            "0.7",
         ]
 
         with patch.object(sys, "argv", argv):
@@ -174,6 +177,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(args.split, "test")
         self.assertEqual(args.checkpoint, Path("runs/head_only_30k/model.pt"))
         self.assertEqual(args.output_path, Path("runs/head_only_30k/test_predictions.json"))
+        self.assertTrue(args.with_xai)
+        self.assertEqual(args.xai_threshold, 0.7)
 
     def test_video_dataset_skips_corrupt_sample_and_logs_warning(self) -> None:
         samples = [
@@ -268,6 +273,80 @@ class PipelineTests(unittest.TestCase):
 
         self.assertTrue(all(not parameter.requires_grad for parameter in model.encoder.parameters()))
         self.assertTrue(all(parameter.requires_grad for parameter in model.classifier.parameters()))
+
+    def test_transformer_head_forward_with_fallback_encoder(self) -> None:
+        model = VideoClassifier(
+            VideoClassifierConfig(
+                hidden_dim=64,
+                use_pretrained=False,
+                head_type="transformer",
+                transformer_head_layers=1,
+                transformer_head_heads=4,
+                transformer_head_ff_dim=128,
+            )
+        )
+        inputs = torch.randn(2, 4, 3, 8, 8)
+
+        logits = model(inputs)
+
+        self.assertEqual(logits.shape, (2,))
+
+    def test_xai_output_structure(self) -> None:
+        model = VideoClassifier(VideoClassifierConfig(hidden_dim=64, use_pretrained=False))
+        inputs = torch.randn(1, 4, 3, 8, 8)
+
+        outputs = model.predict_with_xai(inputs)
+
+        self.assertIn("segments", outputs)
+        self.assertIn("explanations", outputs)
+
+    def test_predict_video_with_xai_returns_json_ready_payload(self) -> None:
+        device = torch.device("cpu")
+        model = VideoClassifier(VideoClassifierConfig(hidden_dim=64, use_pretrained=False))
+        tmp_path = self._make_tmp_path()
+        sample_path = tmp_path / "infer_xai.npy"
+        np.save(sample_path, np.random.randint(0, 255, size=(4, 8, 8, 3), dtype=np.uint8))
+
+        prediction = predict_video(
+            model,
+            sample_path,
+            device=device,
+            num_frames=4,
+            image_size=(8, 8),
+            return_xai=True,
+            xai_threshold=0.6,
+        )
+
+        self.assertIn("frame_importance", prediction)
+        self.assertIn("segments", prediction)
+        self.assertIn("explanations", prediction)
+        json.dumps(prediction)
+
+    def test_cli_parse_args_accepts_transformer_head_options(self) -> None:
+        argv = [
+            "ai-video-detector",
+            "train",
+            "--manifest",
+            "shared.csv",
+            "--output-dir",
+            "outputs/run",
+            "--head-type",
+            "transformer",
+            "--transformer-head-layers",
+            "1",
+            "--transformer-head-heads",
+            "4",
+            "--transformer-head-ff-dim",
+            "128",
+        ]
+
+        with patch.object(sys, "argv", argv):
+            args = parse_args()
+
+        self.assertEqual(args.head_type, "transformer")
+        self.assertEqual(args.transformer_head_layers, 1)
+        self.assertEqual(args.transformer_head_heads, 4)
+        self.assertEqual(args.transformer_head_ff_dim, 128)
 
     def test_json_and_log_output(self) -> None:
         tmp_path = self._make_tmp_path()
