@@ -131,17 +131,18 @@ def run_train(args: argparse.Namespace) -> None:
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
 
-    summary = {}
+    summaries = []
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, device)
         val_metrics = evaluate_model(model, val_loader, device)
         summary = make_epoch_summary(epoch, train_loss, val_metrics)
+        summaries.append(summary)
         print(json.dumps(summary))
 
     checkpoint_path = args.output_dir / "model.pt"
     summary_path = args.output_dir / "train_metrics.json"
     save_checkpoint(model, checkpoint_path)
-    save_epoch_summary(summary_path, summary)
+    save_epoch_summary(summary_path, summaries)
 
 
 def run_infer(args: argparse.Namespace) -> None:

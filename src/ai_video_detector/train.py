@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 import torch
 from torch import nn
@@ -101,6 +101,7 @@ def make_epoch_summary(epoch: int, train_loss: float, val_metrics: Dict[str, flo
         "val_loss": float(val_metrics["val_loss"]),
         "accuracy": float(val_metrics["accuracy"]),
         "f1_score": float(val_metrics["f1_score"]),
+        "roc_auc": float(val_metrics["roc_auc"]),
     }
 
 
@@ -112,6 +113,6 @@ def save_checkpoint(model: nn.Module, path: Union[str, Path]) -> Path:
     return target
 
 
-def save_epoch_summary(path: Union[str, Path], summary: Dict[str, Union[float, int]]) -> Path:
+def save_epoch_summary(path: Union[str, Path], summary: Sequence[Dict[str, Union[float, int]]]) -> Path:
     """Persist training results to JSON."""
     return save_json(path, summary)

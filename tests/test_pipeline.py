@@ -13,7 +13,7 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, TensorDataset
 
-from ai_video_detector.cli import load_manifest, parse_args
+from ai_video_detector.cli import load_manifest, parse_args, run_train
 from ai_video_detector.data import VideoDataset, VideoSample, load_video, load_video_samples_from_manifest
 from ai_video_detector.infer import predict_video
 from ai_video_detector.metrics import compute_classification_metrics
@@ -253,10 +253,11 @@ class PipelineTests(unittest.TestCase):
         metrics = evaluate_model(model, loader, device)
         summary = make_epoch_summary(1, train_loss, metrics)
 
-        self.assertEqual(set(summary), {"epoch", "train_loss", "val_loss", "accuracy", "f1_score"})
+        self.assertEqual(set(summary), {"epoch", "train_loss", "val_loss", "accuracy", "f1_score", "roc_auc"})
         self.assertEqual(summary["epoch"], 1)
         self.assertGreaterEqual(summary["train_loss"], 0.0)
         self.assertGreaterEqual(summary["val_loss"], 0.0)
+        self.assertGreaterEqual(summary["roc_auc"], 0.0)
 
         tmp_path = self._make_tmp_path()
         sample_path = tmp_path / "infer.npy"
@@ -347,6 +348,57 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(args.transformer_head_layers, 1)
         self.assertEqual(args.transformer_head_heads, 4)
         self.assertEqual(args.transformer_head_ff_dim, 128)
+
+    def test_train_cli_saves_all_epoch_summaries(self) -> None:
+        tmp_path = self._make_tmp_path()
+        train_manifest = tmp_path / "train_manifest.json"
+        val_manifest = tmp_path / "val_manifest.json"
+        output_dir = tmp_path / "outputs"
+        sample_a = tmp_path / "sample_a.npy"
+        sample_b = tmp_path / "sample_b.npy"
+        np.save(sample_a, np.random.randint(0, 255, size=(4, 8, 8, 3), dtype=np.uint8))
+        np.save(sample_b, np.random.randint(0, 255, size=(4, 8, 8, 3), dtype=np.uint8))
+        manifest_payload = [
+            {"path": str(sample_a), "label": 0},
+            {"path": str(sample_b), "label": 1},
+        ]
+        train_manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
+        val_manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
+
+        args = type(
+            "Args",
+            (),
+            {
+                "seed": 11,
+                "encoder_name": "MCG-NJU/videomae-base",
+                "no_pretrained": True,
+                "freeze_encoder": False,
+                "head_type": "mlp",
+                "transformer_head_layers": 2,
+                "transformer_head_heads": 8,
+                "transformer_head_ff_dim": 2048,
+                "manifest": None,
+                "train_manifest": train_manifest,
+                "val_manifest": val_manifest,
+                "train_data_root": None,
+                "val_data_root": None,
+                "data_root": None,
+                "train_split": "train",
+                "val_split": "val",
+                "num_frames": 4,
+                "image_size": 8,
+                "batch_size": 2,
+                "epochs": 2,
+                "output_dir": output_dir,
+            },
+        )()
+
+        run_train(args)
+
+        summaries = json.loads((output_dir / "train_metrics.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(summaries), 2)
+        self.assertEqual([summary["epoch"] for summary in summaries], [1, 2])
+        self.assertTrue(all("roc_auc" in summary for summary in summaries))
 
     def test_json_and_log_output(self) -> None:
         tmp_path = self._make_tmp_path()

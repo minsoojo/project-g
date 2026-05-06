@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
-from typing import Any, Dict, Union
+from typing import Any, Union
 
 import numpy as np
 import torch
@@ -28,7 +28,7 @@ def ensure_parent(path: Union[str, Path]) -> Path:
     return target
 
 
-def save_json(path: Union[str, Path], payload: Dict[str, Any]) -> Path:
+def save_json(path: Union[str, Path], payload: Any) -> Path:
     """Write a JSON payload with a stable key order."""
     target = ensure_parent(path)
     target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
