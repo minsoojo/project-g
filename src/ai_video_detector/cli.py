@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from .data import VideoDataset, VideoSample, load_video_samples_from_manifest
 from .infer import predict_video
+from .metrics import compute_classification_metrics
 from .model import VideoClassifier, VideoClassifierConfig
 from .train import build_optimizer, evaluate_model, make_epoch_summary, save_checkpoint, save_epoch_summary, train_one_epoch
 from .utils import set_seed
@@ -39,6 +40,10 @@ def parse_args() -> argparse.Namespace:
     train_parser.add_argument("--no-pretrained", action="store_true")
     train_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
     train_parser.add_argument("--freeze-encoder", action="store_true")
+    train_parser.add_argument("--head-type", choices=("mlp", "transformer"), default="mlp")
+    train_parser.add_argument("--transformer-head-layers", type=int, default=2)
+    train_parser.add_argument("--transformer-head-heads", type=int, default=8)
+    train_parser.add_argument("--transformer-head-ff-dim", type=int, default=2048)
 
     infer_parser = subparsers.add_parser("infer")
     infer_parser.add_argument("--video-path", type=Path, required=True)
@@ -47,12 +52,33 @@ def parse_args() -> argparse.Namespace:
     infer_parser.add_argument("--num-frames", type=int, default=16)
     infer_parser.add_argument("--image-size", type=int, default=224)
     infer_parser.add_argument("--with-xai", action="store_true")
+    infer_parser.add_argument("--xai-threshold", type=float, default=0.6)
     infer_parser.add_argument("--no-pretrained", action="store_true")
     infer_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
     infer_parser.add_argument("--freeze-encoder", action="store_true")
-    # XAI 때문에 추가된 부분
-    infer_parser.add_argument("--with-xai", action="store_true")
-    infer_parser.add_argument("--xai-threshold", type=float, default=0.6)
+    infer_parser.add_argument("--head-type", choices=("mlp", "transformer"), default="mlp")
+    infer_parser.add_argument("--transformer-head-layers", type=int, default=2)
+    infer_parser.add_argument("--transformer-head-heads", type=int, default=8)
+    infer_parser.add_argument("--transformer-head-ff-dim", type=int, default=2048)
+
+    infer_manifest_parser = subparsers.add_parser("infer-manifest")
+    infer_manifest_parser.add_argument("--manifest", type=Path, required=True)
+    infer_manifest_parser.add_argument("--data-root", type=Path)
+    infer_manifest_parser.add_argument("--split", type=str)
+    infer_manifest_parser.add_argument("--checkpoint", type=Path, required=True)
+    infer_manifest_parser.add_argument("--output-path", type=Path, required=True)
+    infer_manifest_parser.add_argument("--num-frames", type=int, default=16)
+    infer_manifest_parser.add_argument("--image-size", type=int, default=224)
+    infer_manifest_parser.add_argument("--limit", type=int)
+    infer_manifest_parser.add_argument("--with-xai", action="store_true")
+    infer_manifest_parser.add_argument("--xai-threshold", type=float, default=0.6)
+    infer_manifest_parser.add_argument("--no-pretrained", action="store_true")
+    infer_manifest_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
+    infer_manifest_parser.add_argument("--freeze-encoder", action="store_true")
+    infer_manifest_parser.add_argument("--head-type", choices=("mlp", "transformer"), default="mlp")
+    infer_manifest_parser.add_argument("--transformer-head-layers", type=int, default=2)
+    infer_manifest_parser.add_argument("--transformer-head-heads", type=int, default=8)
+    infer_manifest_parser.add_argument("--transformer-head-ff-dim", type=int, default=2048)
 
     args = parser.parse_args()
     if args.command == "train":
@@ -79,6 +105,10 @@ def run_train(args: argparse.Namespace) -> None:
         encoder_name=args.encoder_name,
         use_pretrained=not args.no_pretrained,
         freeze_encoder=args.freeze_encoder,
+        head_type=args.head_type,
+        transformer_head_layers=args.transformer_head_layers,
+        transformer_head_heads=args.transformer_head_heads,
+        transformer_head_ff_dim=args.transformer_head_ff_dim,
     )
     model = VideoClassifier(config).to(device)
     optimizer = build_optimizer(model)
@@ -101,17 +131,18 @@ def run_train(args: argparse.Namespace) -> None:
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
 
-    summary = {}
+    summaries = []
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, device)
         val_metrics = evaluate_model(model, val_loader, device)
         summary = make_epoch_summary(epoch, train_loss, val_metrics)
+        summaries.append(summary)
         print(json.dumps(summary))
 
     checkpoint_path = args.output_dir / "model.pt"
     summary_path = args.output_dir / "train_metrics.json"
     save_checkpoint(model, checkpoint_path)
-    save_epoch_summary(summary_path, summary)
+    save_epoch_summary(summary_path, summaries)
 
 
 def run_infer(args: argparse.Namespace) -> None:
@@ -120,6 +151,10 @@ def run_infer(args: argparse.Namespace) -> None:
         encoder_name=args.encoder_name,
         use_pretrained=not args.no_pretrained,
         freeze_encoder=args.freeze_encoder,
+        head_type=args.head_type,
+        transformer_head_layers=args.transformer_head_layers,
+        transformer_head_heads=args.transformer_head_heads,
+        transformer_head_ff_dim=args.transformer_head_ff_dim,
     )
     model = VideoClassifier(config).to(device)
     state_dict = torch.load(args.checkpoint, map_location=device)
@@ -131,10 +166,94 @@ def run_infer(args: argparse.Namespace) -> None:
         num_frames=args.num_frames,
         image_size=(args.image_size, args.image_size),
         return_xai=args.with_xai,
+        xai_threshold=args.xai_threshold,
+        xai_output_dir=args.output_path.parent if args.output_path else Path("."),
     )
     print(json.dumps(payload))
     if args.output_path:
         args.output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def run_infer_manifest(args: argparse.Namespace) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config = VideoClassifierConfig(
+        encoder_name=args.encoder_name,
+        use_pretrained=not args.no_pretrained,
+        freeze_encoder=args.freeze_encoder,
+        head_type=args.head_type,
+        transformer_head_layers=args.transformer_head_layers,
+        transformer_head_heads=args.transformer_head_heads,
+        transformer_head_ff_dim=args.transformer_head_ff_dim,
+    )
+    model = VideoClassifier(config).to(device)
+    state_dict = torch.load(args.checkpoint, map_location=device)
+    model.load_state_dict(state_dict)
+
+    samples = load_manifest(args.manifest, data_root=args.data_root, split=args.split)
+    if args.limit is not None:
+        samples = samples[: args.limit]
+
+    predictions = []
+    confidences = []
+    labels = []
+    failures = []
+    for index, sample in enumerate(samples, start=1):
+        try:
+            prediction = predict_video(
+                model,
+                sample.path,
+                device=device,
+                num_frames=args.num_frames,
+                image_size=(args.image_size, args.image_size),
+                return_xai=args.with_xai,
+                xai_threshold=args.xai_threshold,
+                xai_output_dir=args.output_path.parent,
+            )
+            confidence = float(prediction["confidence"])
+            predictions.append(
+                {
+                    "path": sample.path,
+                    "label": int(sample.label),
+                    **prediction,
+                }
+            )
+            confidences.append(confidence)
+            labels.append(float(sample.label))
+        except Exception as exc:
+            failures.append(
+                {
+                    "path": sample.path,
+                    "label": int(sample.label),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+        if index % 100 == 0:
+            print(
+                f"[INFO] infer progress processed={index} predicted={len(predictions)} failed={len(failures)}",
+                flush=True,
+            )
+
+    metrics = {}
+    if confidences:
+        probs = torch.tensor(confidences, dtype=torch.float32)
+        logits = torch.logit(probs.clamp(1e-6, 1 - 1e-6))
+        label_tensor = torch.tensor(labels, dtype=torch.float32)
+        metrics = compute_classification_metrics(logits, label_tensor)
+
+    payload = {
+        "manifest": str(args.manifest),
+        "split": args.split,
+        "checkpoint": str(args.checkpoint),
+        "num_samples": len(samples),
+        "num_predictions": len(predictions),
+        "num_failures": len(failures),
+        "metrics": metrics,
+        "predictions": predictions,
+        "failures": failures,
+    }
+    args.output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(json.dumps({key: payload[key] for key in ("num_samples", "num_predictions", "num_failures", "metrics")}))
 
 
 def main() -> None:
@@ -144,6 +263,9 @@ def main() -> None:
         return
     if args.command == "infer":
         run_infer(args)
+        return
+    if args.command == "infer-manifest":
+        run_infer_manifest(args)
         return
     raise ValueError(f"Unsupported command: {args.command}")
 

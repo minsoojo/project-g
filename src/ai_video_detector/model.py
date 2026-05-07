@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +24,10 @@ class VideoClassifierConfig:
     dropout: float = 0.1
     use_pretrained: bool = True
     freeze_encoder: bool = False
-
+    head_type: str = "mlp"
+    transformer_head_layers: int = 2
+    transformer_head_heads: int = 8
+    transformer_head_ff_dim: int = 2048
 
 
 @dataclass
@@ -29,6 +35,7 @@ class EncoderOutputs:
     """Feature vector and optional explainability artifacts."""
 
     features: torch.Tensor
+    sequence_features: Optional[torch.Tensor] = None
     frame_importance: Optional[torch.Tensor] = None
     attention_map: Optional[torch.Tensor] = None
     xai_method: str = "none"
@@ -40,6 +47,7 @@ class FallbackVideoEncoder(nn.Module):
     def __init__(self, hidden_dim: int) -> None:
         super().__init__()
         self.stem = nn.Conv3d(3, 32, kernel_size=3, padding=1)
+        self.temporal_output = nn.Linear(32, hidden_dim)
         self.projection = nn.Sequential(
             nn.GELU(),
             nn.Conv3d(32, 64, kernel_size=3, padding=1),
@@ -51,11 +59,13 @@ class FallbackVideoEncoder(nn.Module):
     def encode(self, pixel_values: torch.Tensor) -> EncoderOutputs:
         x = pixel_values.permute(0, 2, 1, 3, 4)
         stem_activations = self.stem(x)
+        sequence_features = self.temporal_output(stem_activations.mean(dim=(3, 4)).permute(0, 2, 1))
         features = self.projection(stem_activations).flatten(1)
         encoded = self.output(features)
         frame_importance = stem_activations.abs().mean(dim=(1, 3, 4))
         return EncoderOutputs(
             features=encoded,
+            sequence_features=sequence_features,
             frame_importance=_normalize_scores(frame_importance),
             attention_map=frame_importance,
             xai_method="activation_energy",
@@ -97,9 +107,10 @@ class VideoMAEEncoder(nn.Module):
     def encode(self, pixel_values: torch.Tensor, return_attention: bool = False) -> EncoderOutputs:
         if self.uses_transformers:
             outputs = self.model(pixel_values=pixel_values, output_attentions=return_attention)
-            features = outputs.last_hidden_state.mean(dim=1)
+            sequence_features = outputs.last_hidden_state
+            features = sequence_features.mean(dim=1)
             if not return_attention:
-                return EncoderOutputs(features=features)
+                return EncoderOutputs(features=features, sequence_features=sequence_features)
 
             frame_importance, attention_map = _compute_videomae_attention_rollup(
                 attentions=outputs.attentions,
@@ -108,6 +119,7 @@ class VideoMAEEncoder(nn.Module):
             )
             return EncoderOutputs(
                 features=features,
+                sequence_features=sequence_features,
                 frame_importance=frame_importance,
                 attention_map=attention_map,
                 xai_method="attention_rollup",
@@ -115,8 +127,62 @@ class VideoMAEEncoder(nn.Module):
         return self.model.encode(pixel_values)
 
 
+class MLPClassifierHead(nn.Module):
+    """MLP classifier head for pooled video features."""
+
+    def __init__(self, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.layers(features)
+
+
+class TransformerClassifierHead(nn.Module):
+    """Transformer encoder head for token or temporal video features."""
+
+    def __init__(self, hidden_dim: int, layers: int, heads: int, ff_dim: int, dropout: float) -> None:
+        super().__init__()
+        if hidden_dim % heads != 0:
+            raise ValueError(f"hidden_dim={hidden_dim} must be divisible by transformer_head_heads={heads}")
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=layers)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.output = nn.Linear(hidden_dim, 1)
+        nn.init.normal_(self.cls_token, std=0.02)
+
+    def forward(self, sequence_features: torch.Tensor) -> torch.Tensor:
+        batch_size = sequence_features.shape[0]
+        cls_token = self.cls_token.expand(batch_size, -1, -1)
+        sequence = torch.cat([cls_token, sequence_features], dim=1)
+        sequence = sequence + _sinusoidal_positions(
+            sequence_length=sequence.shape[1],
+            hidden_dim=sequence.shape[2],
+            device=sequence.device,
+            dtype=sequence.dtype,
+        )
+        encoded = self.encoder(sequence)
+        cls_features = self.norm(encoded[:, 0])
+        return self.output(self.dropout(cls_features))
+
+
 class VideoClassifier(nn.Module):
-    """VideoMAE encoder plus MLP head for binary classification."""
+    """VideoMAE encoder plus selectable head for binary classification."""
 
     def __init__(self, config: Optional[VideoClassifierConfig] = None) -> None:
         super().__init__()
@@ -126,56 +192,88 @@ class VideoClassifier(nn.Module):
             for parameter in self.encoder.parameters():
                 parameter.requires_grad = False
         hidden_dim = self.encoder.hidden_dim
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(self.config.dropout),
-            nn.Linear(hidden_dim // 2, 1),
-        )
+        head_type = self.config.head_type.lower()
+        if head_type == "mlp":
+            self.classifier = MLPClassifierHead(hidden_dim, self.config.dropout)
+        elif head_type == "transformer":
+            self.classifier = TransformerClassifierHead(
+                hidden_dim=hidden_dim,
+                layers=self.config.transformer_head_layers,
+                heads=self.config.transformer_head_heads,
+                ff_dim=self.config.transformer_head_ff_dim,
+                dropout=self.config.dropout,
+            )
+        else:
+            raise ValueError(f"Unsupported head_type: {self.config.head_type}")
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        logits = self.classifier(self.encoder(pixel_values)).squeeze(-1)
+        encoded = self.encoder.encode(pixel_values)
+        logits = self._classify(encoded).squeeze(-1)
         return logits
-    
-    #이 함수를 수정함!
-    
-    def predict_with_xai(self, pixel_values: torch.Tensor) -> Dict:
-        encoded = self.encoder.encode(pixel_values, return_attention=True)
-        logits = self.classifier(encoded.features).squeeze(-1)
 
-        frame_importance = encoded.frame_importance
-        attention_map = encoded.attention_map
+    def predict_with_xai(
+            self,
+            pixel_values: torch.Tensor,
+            threshold: float = 0.6,
+        ) -> Dict[str, Optional[Union[torch.Tensor, str, List[Dict[str, Union[int, float, str]]], List[str]]]]:
+            encoded = self.encoder.encode(pixel_values, return_attention=True)
+            logits = self._classify(encoded).squeeze(-1)
 
-        segments = []
-        explanations = []
+            segments: List[Dict[str, Union[int, float, str]]] = []
+            explanations: List[str] = []
 
-        if frame_importance is not None:
-            fi = frame_importance.squeeze(0)
-            segs = extract_segments(fi)
+            if encoded.frame_importance is not None:
+                frame_importance = encoded.frame_importance.squeeze(0)
+                attention_map = encoded.attention_map
 
-            for seg in segs:
-                anomaly_type = classify_anomaly(fi, attention_map)
-                conf = fi[seg[0]:seg[1]+1].mean().item()
+                for start_frame, end_frame in extract_segments(frame_importance, threshold=threshold):
+                    seg_frame_importance = frame_importance[start_frame:end_frame + 1]
 
-                segments.append({
-                    "start_frame": seg[0],
-                    "end_frame": seg[1],
-                    "type": anomaly_type,
-                    "confidence": conf
-                })
+                    seg_attention = attention_map
+                    if isinstance(attention_map, torch.Tensor) and attention_map.ndim == 4:
+                        num_frames = pixel_values.shape[1]
+                        temporal_tokens = attention_map.shape[1]
 
-                explanations.append(
-                    generate_explanation(seg, anomaly_type, conf)
-                )
+                        token_start = min(
+                            temporal_tokens - 1,
+                            int(round(start_frame * (temporal_tokens - 1) / max(num_frames - 1, 1))),
+                        )
+                        token_end = min(
+                            temporal_tokens - 1,
+                            int(round(end_frame * (temporal_tokens - 1) / max(num_frames - 1, 1))),
+                        )
+                        seg_attention = attention_map[:, token_start:token_end + 1]
 
-        return {
-            "logits": logits,
-            "frame_importance": frame_importance,
-            "attention_map": attention_map,
-            "segments": segments,
-            "explanations": explanations,
-            "xai_method": encoded.xai_method,
-        }
+                    anomaly_type = classify_anomaly(seg_frame_importance, seg_attention)
+                    confidence = float(seg_frame_importance.mean().item())
+
+                    segments.append(
+                        {
+                            "start_frame": int(start_frame),
+                            "end_frame": int(end_frame),
+                            "type": anomaly_type,
+                            "confidence": confidence,
+                        }
+                    )
+                    explanations.append(
+                        generate_explanation((start_frame, end_frame), anomaly_type, confidence)
+                    )
+
+            return {
+                "logits": logits,
+                "frame_importance": encoded.frame_importance,
+                "attention_map": encoded.attention_map,
+                "segments": segments,
+                "explanations": explanations,
+                "xai_method": encoded.xai_method,
+            }
+
+    def _classify(self, encoded: EncoderOutputs) -> torch.Tensor:
+        if isinstance(self.classifier, TransformerClassifierHead):
+            if encoded.sequence_features is None:
+                raise ValueError("Transformer head requires sequence features from the encoder")
+            return self.classifier(encoded.sequence_features)
+        return self.classifier(encoded.features)
 
 
 def _normalize_scores(scores: torch.Tensor) -> torch.Tensor:
@@ -185,83 +283,127 @@ def _normalize_scores(scores: torch.Tensor) -> torch.Tensor:
     return (scores - minimum) / denominator
 
 
+def _sinusoidal_positions(
+    sequence_length: int,
+    hidden_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    positions = torch.arange(sequence_length, device=device, dtype=dtype).unsqueeze(1)
+    dimensions = torch.arange(0, hidden_dim, 2, device=device, dtype=dtype)
+    div_term = torch.exp(dimensions * (-math.log(10000.0) / hidden_dim))
+    encoding = torch.zeros(sequence_length, hidden_dim, device=device, dtype=dtype)
+    encoding[:, 0::2] = torch.sin(positions * div_term)
+    encoding[:, 1::2] = torch.cos(positions * div_term[: encoding[:, 1::2].shape[1]])
+    return encoding.unsqueeze(0)
+
+
 def _compute_videomae_attention_rollup(
-    attentions: Optional[Tuple[torch.Tensor, ...]],
-    num_frames: int,
-    config: object,
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    if not attentions:
-        return None, None
+        attentions: Optional[Tuple[torch.Tensor, ...]],
+        num_frames: int,
+        config: object,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if not attentions:
+            return None, None
 
-    last_attention = attentions[-1].mean(dim=1)
-    token_importance = last_attention.mean(dim=1)
-    temporal_tokens = max(1, num_frames // int(getattr(config, "tubelet_size", 2)))
-    patch_size = int(getattr(config, "patch_size", 16))
-    image_size = getattr(config, "image_size", 224)
-    if isinstance(image_size, (list, tuple)):
-        image_height = int(image_size[0])
-        image_width = int(image_size[1])
-    else:
-        image_height = int(image_size)
-        image_width = int(image_size)
-    spatial_tokens = max(1, (image_height // patch_size) * (image_width // patch_size))
-    expected_tokens = temporal_tokens * spatial_tokens
-    token_importance = token_importance[:, :expected_tokens]
-    if token_importance.shape[-1] < expected_tokens:
-        padding = expected_tokens - token_importance.shape[-1]
-        token_importance = torch.nn.functional.pad(token_importance, (0, padding))
-    attention_map = token_importance.view(token_importance.shape[0], temporal_tokens, spatial_tokens)
-    frame_importance = attention_map.mean(dim=-1)
-    frame_importance = _normalize_scores(frame_importance)
-    if temporal_tokens != num_frames:
-        frame_importance = torch.nn.functional.interpolate(
-            frame_importance.unsqueeze(1),
-            size=num_frames,
-            mode="linear",
-            align_corners=False,
-        ).squeeze(1)
-    return frame_importance, attention_map
+        batch_size = attentions[0].shape[0]
+        num_tokens = attentions[0].shape[-1]
+        device = attentions[0].device
 
-#XAI로 추가된 부분
+        eye = torch.eye(num_tokens, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+        rollout = eye
 
-def extract_segments(frame_importance: torch.Tensor, threshold: float = 0.6):
-    segments = []
-    current = None
+        for attn in attentions:
+            attn = attn.mean(dim=1)  # [B, N, N]
+            attn = attn + eye
+            attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            rollout = torch.bmm(attn, rollout)
 
-    for i, score in enumerate(frame_importance):
-        if score >= threshold:
-            if current is None:
-                current = [i, i]
-            else:
-                current[1] = i
+        if rollout.shape[-1] > 1:
+            token_importance = rollout[:, 0, :]  # [B, N]
         else:
-            if current is not None:
-                segments.append(tuple(current))
-                current = None
+            token_importance = rollout.mean(dim=1)
 
-    if current is not None:
-        segments.append(tuple(current))
+        tubelet_size = int(getattr(config, "tubelet_size", 2))
+        patch_size = int(getattr(config, "patch_size", 16))
+        image_size = getattr(config, "image_size", 224)
+
+        if isinstance(image_size, (list, tuple)):
+            image_height = int(image_size[0])
+            image_width = int(image_size[1])
+        else:
+            image_height = int(image_size)
+            image_width = int(image_size)
+
+        temporal_tokens = max(1, num_frames // tubelet_size)
+        grid_h = max(1, image_height // patch_size)
+        grid_w = max(1, image_width // patch_size)
+        spatial_tokens = grid_h * grid_w
+        expected_tokens = temporal_tokens * spatial_tokens
+
+        if token_importance.shape[-1] == expected_tokens + 1:
+            token_importance = token_importance[:, 1:]
+        else:
+            token_importance = token_importance[:, :expected_tokens]
+
+        if token_importance.shape[-1] < expected_tokens:
+            padding = expected_tokens - token_importance.shape[-1]
+            token_importance = F.pad(token_importance, (0, padding))
+
+        # [B, T_token, H_patch, W_patch]
+        attention_map = token_importance.view(batch_size, temporal_tokens, grid_h, grid_w)
+
+        # temporal importance
+        frame_importance = attention_map.mean(dim=(2, 3))
+        frame_importance = _normalize_scores(frame_importance)
+
+        if temporal_tokens != num_frames:
+            frame_importance = F.interpolate(
+                frame_importance.unsqueeze(1),
+                size=num_frames,
+                mode="linear",
+                align_corners=False,
+            ).squeeze(1)
+
+        return frame_importance, attention_map
+
+
+def extract_segments(frame_importance: torch.Tensor, threshold: float = 0.6) -> List[Tuple[int, int]]:
+    """Group consecutive high-importance frames into segments."""
+    segments: List[Tuple[int, int]] = []
+    current_start: Optional[int] = None
+
+    for index, score in enumerate(frame_importance):
+        if float(score.item()) >= threshold:
+            if current_start is None:
+                current_start = index
+        elif current_start is not None:
+            segments.append((current_start, index - 1))
+            current_start = None
+
+    if current_start is not None:
+        segments.append((current_start, frame_importance.shape[0] - 1))
 
     return segments
 
 
-def classify_anomaly(frame_importance, attention_map):
+def classify_anomaly(frame_importance: torch.Tensor, attention_map: Optional[torch.Tensor]) -> str:
     if attention_map is None:
         return "unknown"
 
-    spatial_var = attention_map.var().item()
-    temporal_var = frame_importance.var().item()
+    temporal_var = float(frame_importance.var().item())
+    spatial_var = float(attention_map.var().item()) if isinstance(attention_map, torch.Tensor) else 0.0
+    mean_importance = float(frame_importance.mean().item())
 
-    if temporal_var > 0.1:
+    if temporal_var > 0.10:
         return "movement anomaly"
-    elif spatial_var > 0.1:
+    if spatial_var > 0.10:
         return "texture jitter"
-    elif frame_importance.mean().item() > 0.7:
+    if mean_importance > 0.70:
         return "lighting anomaly"
-    else:
-        return "object inconsistency"
+    return "object inconsistency"
 
 
-def generate_explanation(segment, anomaly_type, confidence):
-    start, end = segment
-    return f"Frames {start} to {end} show {anomaly_type} (confidence {confidence:.2f})"
+def generate_explanation(segment: Tuple[int, int], anomaly_type: str, confidence: float) -> str:
+    start_frame, end_frame = segment
+    return f"Frames {start_frame} to {end_frame} show {anomaly_type} (confidence {confidence:.2f})"
