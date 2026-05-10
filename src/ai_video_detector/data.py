@@ -10,7 +10,7 @@ from typing import Callable, Iterable, Optional, Union
 
 import numpy as np
 import torch
-from PIL import Image, ImageSequence
+from PIL import Image, ImageFile, ImageSequence
 from torch.utils.data import Dataset
 
 from .preprocessing import normalize_frames, resize_frames, temporal_sample
@@ -75,15 +75,20 @@ def load_video(path: Union[str, Path]) -> np.ndarray:
 
 
 def _load_gif(path: Path) -> np.ndarray:
+    frames = []
+    previous_truncated_setting = ImageFile.LOAD_TRUNCATED_IMAGES
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
     try:
         with Image.open(path) as image:
-            frames = np.stack(
-                [np.asarray(frame.convert("RGB")) for frame in ImageSequence.Iterator(image)],
-                axis=0,
-            )
-        return _validate_frames(frames)
+            for frame in ImageSequence.Iterator(image):
+                frames.append(np.asarray(frame.convert("RGB")))
+        return _validate_frames(np.stack(frames, axis=0))
     except Exception as exc:
+        if frames:
+            return _validate_frames(np.stack(frames, axis=0))
         raise OSError(f"Failed to load GIF '{path}': {exc}") from exc
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = previous_truncated_setting
 
 
 def load_video_samples_from_manifest(

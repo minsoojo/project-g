@@ -1,12 +1,14 @@
 # Python cache / test artifacts
 __pycache__/
 *.py[cod]
+*.pyc.*
 .pytest_cache/
 
 # Local runtime temp directories
 .test_run/
 .tmp_test_outputs/
 tmp_test_outputs_runtime/
+.server_downloads/
 
 # Local logs
 logs/
@@ -25,6 +27,8 @@ scripts/
 
 # Local model outputs
 tmp_test/
+
+tools/
 
 # Generated dataset manifests with machine-local absolute paths
 manifests/train_manifest.json
