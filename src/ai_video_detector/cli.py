@@ -18,6 +18,10 @@ from .train import build_optimizer, evaluate_model, make_epoch_summary, save_che
 from .utils import set_seed
 
 
+DEFAULT_ENCODER_NAME = "/home/t26106/ai-detection/project-g/models/videomae-base"
+DEFAULT_HEAD_TYPE = "transformer"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="AI-generated video detection baseline")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -38,9 +42,9 @@ def parse_args() -> argparse.Namespace:
     train_parser.add_argument("--image-size", type=int, default=224)
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument("--no-pretrained", action="store_true")
-    train_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
+    train_parser.add_argument("--encoder-name", type=str, default=DEFAULT_ENCODER_NAME)
     train_parser.add_argument("--freeze-encoder", action="store_true")
-    train_parser.add_argument("--head-type", choices=("mlp", "transformer"), default="mlp")
+    train_parser.add_argument("--head-type", choices=("mlp", "transformer"), default=DEFAULT_HEAD_TYPE)
     train_parser.add_argument("--transformer-head-layers", type=int, default=2)
     train_parser.add_argument("--transformer-head-heads", type=int, default=8)
     train_parser.add_argument("--transformer-head-ff-dim", type=int, default=2048)
@@ -54,9 +58,9 @@ def parse_args() -> argparse.Namespace:
     infer_parser.add_argument("--with-xai", action="store_true")
     infer_parser.add_argument("--xai-threshold", type=float, default=0.6)
     infer_parser.add_argument("--no-pretrained", action="store_true")
-    infer_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
+    infer_parser.add_argument("--encoder-name", type=str, default=DEFAULT_ENCODER_NAME)
     infer_parser.add_argument("--freeze-encoder", action="store_true")
-    infer_parser.add_argument("--head-type", choices=("mlp", "transformer"), default="mlp")
+    infer_parser.add_argument("--head-type", choices=("mlp", "transformer"), default=DEFAULT_HEAD_TYPE)
     infer_parser.add_argument("--transformer-head-layers", type=int, default=2)
     infer_parser.add_argument("--transformer-head-heads", type=int, default=8)
     infer_parser.add_argument("--transformer-head-ff-dim", type=int, default=2048)
@@ -73,9 +77,9 @@ def parse_args() -> argparse.Namespace:
     infer_manifest_parser.add_argument("--with-xai", action="store_true")
     infer_manifest_parser.add_argument("--xai-threshold", type=float, default=0.6)
     infer_manifest_parser.add_argument("--no-pretrained", action="store_true")
-    infer_manifest_parser.add_argument("--encoder-name", type=str, default="MCG-NJU/videomae-base")
+    infer_manifest_parser.add_argument("--encoder-name", type=str, default=DEFAULT_ENCODER_NAME)
     infer_manifest_parser.add_argument("--freeze-encoder", action="store_true")
-    infer_manifest_parser.add_argument("--head-type", choices=("mlp", "transformer"), default="mlp")
+    infer_manifest_parser.add_argument("--head-type", choices=("mlp", "transformer"), default=DEFAULT_HEAD_TYPE)
     infer_manifest_parser.add_argument("--transformer-head-layers", type=int, default=2)
     infer_manifest_parser.add_argument("--transformer-head-heads", type=int, default=8)
     infer_manifest_parser.add_argument("--transformer-head-ff-dim", type=int, default=2048)

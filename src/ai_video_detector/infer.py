@@ -40,13 +40,36 @@ def predict_video(
     prediction = "ai_generated" if confidence >= 0.5 else "real"
     payload: Dict[str, Any] = {"prediction": prediction, "confidence": confidence}
     if outputs is not None:
-        frame_importance = outputs["frame_importance"]
-        if isinstance(frame_importance, torch.Tensor):
-            payload["frame_importance"] = [float(value) for value in frame_importance.squeeze(0).detach().cpu().tolist()]
-        payload["segments"] = outputs.get("segments", [])
-        payload["explanations"] = outputs.get("explanations", [])
-        payload["xai_method"] = str(outputs["xai_method"])
+        payload["xai"] = _format_xai_output(outputs, threshold=xai_threshold)
     return payload
+
+
+def _format_xai_output(outputs: Dict[str, Any], threshold: float) -> Dict[str, Any]:
+    frame_importance = outputs.get("frame_importance")
+    frame_scores = _tensor_to_float_list(frame_importance)
+    segments = outputs.get("segments", [])
+    explanations = outputs.get("explanations", [])
+    return {
+        "method": str(outputs.get("xai_method", "")),
+        "threshold": float(threshold),
+        "frame_importance": frame_scores,
+        "segments": segments,
+        "explanations": explanations,
+        "summary": {
+            "num_frames": len(frame_scores),
+            "num_segments": len(segments),
+            "max_frame_importance": max(frame_scores) if frame_scores else None,
+        },
+    }
+
+
+def _tensor_to_float_list(value: Any) -> list[float]:
+    if isinstance(value, torch.Tensor):
+        flattened = value.squeeze(0).detach().cpu().tolist()
+        return [float(score) for score in flattened]
+    if isinstance(value, list):
+        return [float(score) for score in value]
+    return []
 
 
 def save_prediction(path: Union[str, Path], payload: Dict[str, Any]) -> Path:

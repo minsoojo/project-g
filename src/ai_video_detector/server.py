@@ -3,20 +3,26 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from PIL import Image
 from pydantic import BaseModel, Field, field_validator
 
+from .data import load_video
 from .infer import predict_video
 from .model import VideoClassifier, VideoClassifierConfig
+from .preprocessing import temporal_sample
 
 
 DEFAULT_MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
@@ -40,11 +46,31 @@ class AnalyzeRequest(BaseModel):
         return value
 
 
+class Evidence(BaseModel):
+    frame_importance: List[float]
+    segments: List[Dict[str, Any]]
+    explanations: List[str]
+
+
+class HeatmapInfo(BaseModel):
+    frame_idx: int
+    importance: float
+    focus_area: List[str]
+    heatmap_url: str
+    overlay_url: str
+
+
+class XAIVisualization(BaseModel):
+    method: str
+    heatmaps: List[HeatmapInfo]
+
+
 class AnalyzeResponse(BaseModel):
-    request_id: Optional[str] = None
-    model: str
-    s3_url: str
-    result: Dict[str, Any]
+    decision: str
+    t2v_prob: float
+    model_used: str
+    evidence: Evidence
+    xai_visualization: XAIVisualization
 
 
 @dataclass(frozen=True)
@@ -59,9 +85,12 @@ class AnalyzerConfig:
     transformer_head_ff_dim: int = 2048
     num_frames: int = 16
     image_size: int = 224
-    with_xai: bool = False
+    with_xai: bool = True
     xai_threshold: float = 0.6
     max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES
+    max_heatmaps: int = 5
+    xai_output_dir: Path = Path("outputs/xai")
+    model_used: str = "VideoMAE"
 
     @classmethod
     def from_env(cls, prefix: str) -> "AnalyzerConfig":
@@ -82,6 +111,9 @@ class AnalyzerConfig:
             with_xai=_env_bool(f"{prefix}_WITH_XAI", cls.with_xai),
             xai_threshold=_env_float(f"{prefix}_XAI_THRESHOLD", cls.xai_threshold),
             max_download_bytes=_env_int(f"{prefix}_MAX_DOWNLOAD_BYTES", cls.max_download_bytes),
+            max_heatmaps=_env_int(f"{prefix}_MAX_HEATMAPS", cls.max_heatmaps),
+            xai_output_dir=get_xai_output_dir(),
+            model_used=os.getenv(f"{prefix}_MODEL_USED", cls.model_used),
         )
 
 
@@ -94,14 +126,14 @@ class ModelAnalyzer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model: Optional[torch.nn.Module] = None
 
-    def analyze_url(self, url: str) -> Dict[str, Any]:
+    def analyze_url(self, url: str, *, request_id: Optional[str] = None) -> AnalyzeResponse:
         model = self._load_model()
         suffix = _suffix_from_url(url)
         with tempfile.NamedTemporaryFile(prefix=f"{self.name}_", suffix=suffix, delete=False) as handle:
             temp_path = Path(handle.name)
         try:
             download_url(url, temp_path, max_bytes=self.config.max_download_bytes)
-            return predict_video(
+            result = predict_video(
                 model,
                 temp_path,
                 device=self.device,
@@ -110,8 +142,76 @@ class ModelAnalyzer:
                 return_xai=self.config.with_xai,
                 xai_threshold=self.config.xai_threshold,
             )
+            return self._format_response(result, temp_path, request_id=request_id)
         finally:
             temp_path.unlink(missing_ok=True)
+
+    def _format_response(
+        self,
+        result: Dict[str, Any],
+        video_path: Path,
+        *,
+        request_id: Optional[str],
+    ) -> AnalyzeResponse:
+        t2v_prob = float(result["confidence"])
+        xai = result.get("xai", {})
+        frame_importance = [float(value) for value in result.get("frame_importance", xai.get("frame_importance", []))]
+        method = str(result.get("xai_method", xai.get("method", "none")))
+        heatmaps = self._build_heatmaps(video_path, frame_importance, request_id=request_id)
+        return AnalyzeResponse(
+            decision="FAKE" if t2v_prob >= 0.5 else "REAL",
+            t2v_prob=t2v_prob,
+            model_used=self.config.model_used,
+            evidence=Evidence(
+                frame_importance=frame_importance,
+                segments=list(result.get("segments", xai.get("segments", []))),
+                explanations=list(result.get("explanations", xai.get("explanations", []))),
+            ),
+            xai_visualization=XAIVisualization(
+                method=_normalize_xai_method(method),
+                heatmaps=heatmaps,
+            ),
+        )
+
+    def _build_heatmaps(
+        self,
+        video_path: Path,
+        frame_importance: List[float],
+        *,
+        request_id: Optional[str],
+    ) -> List[HeatmapInfo]:
+        if not frame_importance:
+            return []
+
+        frames = torch.from_numpy(load_video(video_path))
+        sampled = temporal_sample(frames, len(frame_importance)).numpy()
+        selected_indices = _top_frame_indices(frame_importance, self.config.max_heatmaps, self.config.xai_threshold)
+        if not selected_indices:
+            return []
+
+        video_key = _safe_file_key(request_id or video_path.stem)
+        heatmap_dir = self.config.xai_output_dir / "heatmaps"
+        overlay_dir = self.config.xai_output_dir / "overlay"
+        heatmap_dir.mkdir(parents=True, exist_ok=True)
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+
+        heatmaps: List[HeatmapInfo] = []
+        for frame_idx in selected_indices:
+            importance = float(frame_importance[frame_idx])
+            frame = _uint8_frame(sampled[frame_idx])
+            heatmap_path = heatmap_dir / f"{video_key}_frame{frame_idx}.jpg"
+            overlay_path = overlay_dir / f"{video_key}_frame{frame_idx}.jpg"
+            _save_heatmap_images(frame, importance, heatmap_path, overlay_path)
+            heatmaps.append(
+                HeatmapInfo(
+                    frame_idx=frame_idx,
+                    importance=importance,
+                    focus_area=[],
+                    heatmap_url=f"/xai/heatmaps/{heatmap_path.name}",
+                    overlay_url=f"/xai/overlay/{overlay_path.name}",
+                )
+            )
+        return heatmaps
 
     def _load_model(self) -> torch.nn.Module:
         if self.model is not None:
@@ -138,6 +238,9 @@ class ModelAnalyzer:
 
 def create_app() -> FastAPI:
     api = FastAPI(title="AI Video Detector API")
+    xai_root = get_xai_output_dir()
+    xai_root.mkdir(parents=True, exist_ok=True)
+    api.mount("/xai", StaticFiles(directory=str(xai_root)), name="xai")
 
     @api.get("/health")
     def health() -> Dict[str, str]:
@@ -149,15 +252,9 @@ def create_app() -> FastAPI:
         analyzer: ModelAnalyzer = Depends(get_t2v_analyzer),
     ) -> AnalyzeResponse:
         try:
-            result = analyzer.analyze_url(request.s3_url)
+            return analyzer.analyze_url(request.s3_url, request_id=request.request_id)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
-        return AnalyzeResponse(
-            request_id=request.request_id,
-            model=analyzer.name,
-            s3_url=request.s3_url,
-            result=result,
-        )
 
     return api
 
@@ -165,6 +262,10 @@ def create_app() -> FastAPI:
 @lru_cache(maxsize=1)
 def get_t2v_analyzer() -> ModelAnalyzer:
     return ModelAnalyzer("t2v", AnalyzerConfig.from_env("T2V"))
+
+
+def get_xai_output_dir() -> Path:
+    return Path(os.getenv("XAI_OUTPUT_DIR", "outputs/xai"))
 
 
 def download_url(url: str, destination: Path, *, max_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES) -> Path:
@@ -193,6 +294,47 @@ def _suffix_from_url(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     suffix = Path(urllib.parse.unquote(parsed.path)).suffix.lower()
     return suffix if suffix in {".npy", ".pt", ".gif", ".mp4", ".avi", ".mov", ".mkv"} else ".mp4"
+
+
+def _top_frame_indices(frame_importance: List[float], max_items: int, threshold: float) -> List[int]:
+    ranked = sorted(range(len(frame_importance)), key=lambda index: frame_importance[index], reverse=True)
+    above_threshold = [index for index in ranked if frame_importance[index] >= threshold]
+    selected = above_threshold or ranked[:1]
+    return sorted(selected[:max_items])
+
+
+def _safe_file_key(value: str) -> str:
+    key = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    return key or "video"
+
+
+def _uint8_frame(frame: np.ndarray) -> np.ndarray:
+    if frame.dtype == np.uint8:
+        return frame
+    return np.clip(frame, 0, 255).astype(np.uint8)
+
+
+def _save_heatmap_images(frame: np.ndarray, importance: float, heatmap_path: Path, overlay_path: Path) -> None:
+    height, width = frame.shape[:2]
+    intensity = int(np.clip(importance, 0.0, 1.0) * 255)
+    alpha = np.full((height, width), intensity, dtype=np.uint8)
+    red = np.full((height, width), 255, dtype=np.uint8)
+    green = np.maximum(0, 180 - alpha // 2).astype(np.uint8)
+    blue = np.zeros((height, width), dtype=np.uint8)
+    heatmap_rgb = np.stack([red, green, blue], axis=-1)
+
+    heatmap_image = Image.fromarray(heatmap_rgb, mode="RGB")
+    frame_image = Image.fromarray(frame, mode="RGB")
+    overlay_image = Image.blend(frame_image, heatmap_image, alpha=0.35 + min(importance, 1.0) * 0.25)
+
+    heatmap_image.save(heatmap_path, format="JPEG", quality=90)
+    overlay_image.save(overlay_path, format="JPEG", quality=90)
+
+
+def _normalize_xai_method(method: str) -> str:
+    if method == "attention_rollup":
+        return "attention_rollout"
+    return method
 
 
 def _env_bool(name: str, default: bool) -> bool:

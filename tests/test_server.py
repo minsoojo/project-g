@@ -1,19 +1,31 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import patch
 
+import numpy as np
 from fastapi.testclient import TestClient
 
-from ai_video_detector.server import ModelAnalyzer, app, get_t2v_analyzer
+from ai_video_detector.server import AnalyzeResponse, Evidence, ModelAnalyzer, XAIVisualization, app, get_t2v_analyzer
 
 
 class StubAnalyzer:
     name = "t2v"
 
-    def analyze_url(self, url: str) -> Dict[str, Any]:
-        return {"prediction": "real", "confidence": 0.25, "received_url": url}
+    def analyze_url(self, url: str, *, request_id: str | None = None) -> AnalyzeResponse:
+        return AnalyzeResponse(
+            decision="REAL",
+            t2v_prob=0.25,
+            model_used="VideoMAE",
+            evidence=Evidence(
+                frame_importance=[0.25],
+                segments=[],
+                explanations=[],
+            ),
+            xai_visualization=XAIVisualization(method="attention_rollout", heatmaps=[]),
+        )
 
 
 class ServerTests(unittest.TestCase):
@@ -33,10 +45,11 @@ class ServerTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["request_id"], "req-1")
-        self.assertEqual(payload["model"], "t2v")
-        self.assertEqual(payload["result"]["prediction"], "real")
-        self.assertTrue(payload["result"]["received_url"].startswith("https://bucket.s3"))
+        self.assertEqual(payload["decision"], "REAL")
+        self.assertEqual(payload["t2v_prob"], 0.25)
+        self.assertEqual(payload["model_used"], "VideoMAE")
+        self.assertEqual(payload["evidence"]["frame_importance"], [0.25])
+        self.assertEqual(payload["xai_visualization"]["method"], "attention_rollout")
 
     def test_t2v_analyze_rejects_non_http_url(self) -> None:
         app.dependency_overrides[get_t2v_analyzer] = lambda: StubAnalyzer()
@@ -58,6 +71,9 @@ class ServerTests(unittest.TestCase):
             image_size = 8
             with_xai = False
             xai_threshold = 0.6
+            max_heatmaps = 5
+            xai_output_dir = None
+            model_used = "VideoMAE"
 
         analyzer.config = Config()
         analyzer.device = "cpu"
@@ -78,9 +94,48 @@ class ServerTests(unittest.TestCase):
         ), patch.object(analyzer, "_load_model", lambda: analyzer.model):
             result = analyzer.analyze_url("https://example.com/video.gif")
 
-        self.assertEqual(result["prediction"], "ai_generated")
+        self.assertEqual(result.decision, "FAKE")
+        self.assertEqual(result.t2v_prob, 0.8)
         self.assertTrue(created_paths)
         self.assertFalse(created_paths[0].exists())
+
+    def test_model_analyzer_generates_heatmap_files(self) -> None:
+        tmp_path = Path(".tmp_test_outputs") / self._testMethodName
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        video_path = tmp_path / "video.npy"
+        np.save(video_path, np.random.randint(0, 255, size=(3, 8, 8, 3), dtype=np.uint8))
+
+        analyzer = ModelAnalyzer.__new__(ModelAnalyzer)
+        analyzer.name = "t2v"
+
+        class Config:
+            max_heatmaps = 2
+            xai_threshold = 0.6
+            xai_output_dir = tmp_path / "xai"
+            model_used = "VideoMAE"
+
+        analyzer.config = Config()
+        result = analyzer._format_response(
+            {
+                "prediction": "ai_generated",
+                "confidence": 0.91,
+                "xai": {
+                    "frame_importance": [0.12, 0.88, 0.76],
+                    "segments": [{"start_frame": 1, "end_frame": 2, "type": "movement anomaly", "confidence": 0.82}],
+                    "explanations": ["Frames 1 to 2 show movement anomaly."],
+                    "method": "attention_rollup",
+                },
+            },
+            video_path,
+            request_id="video123",
+        )
+
+        self.assertEqual(result.decision, "FAKE")
+        self.assertEqual(result.xai_visualization.method, "attention_rollout")
+        self.assertEqual(len(result.xai_visualization.heatmaps), 2)
+        for heatmap in result.xai_visualization.heatmaps:
+            self.assertTrue((tmp_path / heatmap.heatmap_url.lstrip("/")).exists())
+            self.assertTrue((tmp_path / heatmap.overlay_url.lstrip("/")).exists())
 
 
 if __name__ == "__main__":

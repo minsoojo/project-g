@@ -318,9 +318,15 @@ class PipelineTests(unittest.TestCase):
             xai_threshold=0.6,
         )
 
-        self.assertIn("frame_importance", prediction)
-        self.assertIn("segments", prediction)
-        self.assertIn("explanations", prediction)
+        self.assertIn("xai", prediction)
+        self.assertEqual(set(prediction["xai"]), {"method", "threshold", "frame_importance", "segments", "explanations", "summary"})
+        self.assertEqual(
+            set(prediction["xai"]["summary"]),
+            {"num_frames", "num_segments", "max_frame_importance"},
+        )
+        self.assertNotIn("frame_importance", prediction)
+        self.assertNotIn("segments", prediction)
+        self.assertNotIn("explanations", prediction)
         json.dumps(prediction)
 
     def test_cli_parse_args_accepts_transformer_head_options(self) -> None:
