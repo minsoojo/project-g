@@ -17,7 +17,7 @@ from ai_video_detector.cli import load_manifest, parse_args, run_train
 from ai_video_detector.data import VideoDataset, VideoSample, load_video, load_video_samples_from_manifest
 from ai_video_detector.infer import predict_video
 from ai_video_detector.metrics import compute_classification_metrics
-from ai_video_detector.model import VideoClassifier, VideoClassifierConfig
+from ai_video_detector.model import VideoClassifier, VideoClassifierConfig, VideoMAEEncoder
 from ai_video_detector.train import build_optimizer, evaluate_model, make_epoch_summary, train_one_epoch
 from ai_video_detector.utils import log_message, save_json, set_seed
 
@@ -300,6 +300,38 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIn("segments", outputs)
         self.assertIn("explanations", outputs)
+
+    def test_transformer_xai_enables_eager_attention_and_marks_missing_attention(self) -> None:
+        class FakeTransformer(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.config = type("Config", (), {"hidden_size": 64})()
+                self.attn_implementation = None
+
+            def set_attn_implementation(self, value: str) -> None:
+                self.attn_implementation = value
+
+            def forward(self, pixel_values: torch.Tensor, output_attentions: bool = False):
+                return type(
+                    "Outputs",
+                    (),
+                    {
+                        "last_hidden_state": torch.ones(pixel_values.shape[0], 2, 64),
+                        "attentions": None,
+                    },
+                )()
+
+        encoder = VideoMAEEncoder(VideoClassifierConfig(hidden_dim=64, use_pretrained=False))
+        fake_model = FakeTransformer()
+        encoder.model = fake_model
+        encoder.uses_transformers = True
+        encoder.hidden_dim = 64
+
+        outputs = encoder.encode(torch.randn(1, 4, 3, 8, 8), return_attention=True)
+
+        self.assertEqual(fake_model.attn_implementation, "eager")
+        self.assertIsNone(outputs.frame_importance)
+        self.assertEqual(outputs.xai_method, "unavailable")
 
     def test_predict_video_with_xai_returns_json_ready_payload(self) -> None:
         device = torch.device("cpu")

@@ -104,6 +104,8 @@ class VideoMAEEncoder(nn.Module):
 
     def encode(self, pixel_values: torch.Tensor, return_attention: bool = False) -> EncoderOutputs:
         if self.uses_transformers:
+            if return_attention:
+                _enable_eager_attention(self.model)
             outputs = self.model(pixel_values=pixel_values, output_attentions=return_attention)
             sequence_features = outputs.last_hidden_state
             features = sequence_features.mean(dim=1)
@@ -115,12 +117,13 @@ class VideoMAEEncoder(nn.Module):
                 num_frames=pixel_values.shape[1],
                 config=self.model.config,
             )
+            xai_method = "attention_rollup" if frame_importance is not None else "unavailable"
             return EncoderOutputs(
                 features=features,
                 sequence_features=sequence_features,
                 frame_importance=frame_importance,
                 attention_map=attention_map,
-                xai_method="attention_rollup",
+                xai_method=xai_method,
             )
         return self.model.encode(pixel_values)
 
@@ -270,6 +273,17 @@ def _sinusoidal_positions(
     encoding[:, 0::2] = torch.sin(positions * div_term)
     encoding[:, 1::2] = torch.cos(positions * div_term[: encoding[:, 1::2].shape[1]])
     return encoding.unsqueeze(0)
+
+
+def _enable_eager_attention(model: nn.Module) -> None:
+    set_attention = getattr(model, "set_attn_implementation", None)
+    if callable(set_attention):
+        set_attention("eager")
+        return
+
+    config = getattr(model, "config", None)
+    if config is not None and hasattr(config, "attn_implementation"):
+        setattr(config, "attn_implementation", "eager")
 
 
 def _compute_videomae_attention_rollup(
