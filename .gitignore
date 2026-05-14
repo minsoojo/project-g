@@ -27,6 +27,7 @@ scripts/
 
 # Local model outputs
 tmp_test/
+runs/
 
 tools/
 
