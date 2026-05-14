@@ -20,6 +20,28 @@ def temporal_sample(frames: torch.Tensor, num_frames: int) -> torch.Tensor:
     return frames[indices]
 
 
+def temporal_sample_clips(frames: torch.Tensor, num_frames: int, num_clips: int) -> torch.Tensor:
+    """Sample multiple fixed-length clips across a full video."""
+    total_frames = frames.shape[0]
+    if total_frames == 0:
+        raise ValueError("frames must contain at least one frame")
+    if num_clips <= 0:
+        raise ValueError("num_clips must be positive")
+    if num_clips == 1:
+        return temporal_sample(frames, num_frames).unsqueeze(0)
+
+    boundaries = torch.linspace(0, total_frames, steps=num_clips + 1).round().long()
+    clips = []
+    for index in range(num_clips):
+        start = int(boundaries[index].item())
+        end = int(boundaries[index + 1].item())
+        if end <= start:
+            start = min(start, total_frames - 1)
+            end = start + 1
+        clips.append(temporal_sample(frames[start:end], num_frames))
+    return torch.stack(clips, dim=0)
+
+
 def resize_frames(frames: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     """Resize frames to the target image size."""
     frames_bchw = frames.permute(0, 3, 1, 2)
