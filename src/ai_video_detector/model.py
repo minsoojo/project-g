@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 logger = logging.getLogger(__name__)
@@ -225,12 +226,19 @@ class VideoClassifier(nn.Module):
         if encoded.frame_importance is not None:
             frame_importance = encoded.frame_importance.squeeze(0)
             for start_frame, end_frame in extract_segments(frame_importance, threshold=threshold):
-                anomaly_type = classify_anomaly(frame_importance, encoded.attention_map)
-                confidence = float(frame_importance[start_frame : end_frame + 1].mean().item())
+                segment_importance = frame_importance[start_frame : end_frame + 1]
+                segment_attention = _slice_segment_attention(
+                    attention_map=encoded.attention_map,
+                    start_frame=start_frame,
+                    end_frame=end_frame,
+                    num_frames=pixel_values.shape[1],
+                )
+                anomaly_type = classify_anomaly(segment_importance, segment_attention)
+                confidence = float(segment_importance.mean().item())
                 segments.append(
                     {
-                        "start_frame": start_frame,
-                        "end_frame": end_frame,
+                        "start_frame": int(start_frame),
+                        "end_frame": int(end_frame),
                         "type": anomaly_type,
                         "confidence": confidence,
                     }
@@ -286,6 +294,27 @@ def _enable_eager_attention(model: nn.Module) -> None:
         setattr(config, "attn_implementation", "eager")
 
 
+def _slice_segment_attention(
+    attention_map: Optional[torch.Tensor],
+    start_frame: int,
+    end_frame: int,
+    num_frames: int,
+) -> Optional[torch.Tensor]:
+    if not isinstance(attention_map, torch.Tensor) or attention_map.ndim != 4:
+        return attention_map
+
+    temporal_tokens = attention_map.shape[1]
+    token_start = min(
+        temporal_tokens - 1,
+        int(round(start_frame * (temporal_tokens - 1) / max(num_frames - 1, 1))),
+    )
+    token_end = min(
+        temporal_tokens - 1,
+        int(round(end_frame * (temporal_tokens - 1) / max(num_frames - 1, 1))),
+    )
+    return attention_map[:, token_start : token_end + 1]
+
+
 def _compute_videomae_attention_rollup(
     attentions: Optional[Tuple[torch.Tensor, ...]],
     num_frames: int,
@@ -294,8 +323,23 @@ def _compute_videomae_attention_rollup(
     if not attentions:
         return None, None
 
-    last_attention = attentions[-1].mean(dim=1)
-    token_importance = last_attention.mean(dim=1)
+    batch_size = attentions[0].shape[0]
+    num_tokens = attentions[0].shape[-1]
+    device = attentions[0].device
+    eye = torch.eye(num_tokens, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+    rollout = eye
+
+    for attention in attentions:
+        layer_attention = attention.mean(dim=1)
+        layer_attention = layer_attention + eye
+        layer_attention = layer_attention / layer_attention.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        rollout = torch.bmm(layer_attention, rollout)
+
+    if rollout.shape[-1] > 1:
+        token_importance = rollout[:, 0, :]
+    else:
+        token_importance = rollout.mean(dim=1)
+
     temporal_tokens = max(1, num_frames // int(getattr(config, "tubelet_size", 2)))
     patch_size = int(getattr(config, "patch_size", 16))
     image_size = getattr(config, "image_size", 224)
@@ -305,17 +349,22 @@ def _compute_videomae_attention_rollup(
     else:
         image_height = int(image_size)
         image_width = int(image_size)
-    spatial_tokens = max(1, (image_height // patch_size) * (image_width // patch_size))
+    grid_h = max(1, image_height // patch_size)
+    grid_w = max(1, image_width // patch_size)
+    spatial_tokens = grid_h * grid_w
     expected_tokens = temporal_tokens * spatial_tokens
-    token_importance = token_importance[:, :expected_tokens]
+    if token_importance.shape[-1] == expected_tokens + 1:
+        token_importance = token_importance[:, 1:]
+    else:
+        token_importance = token_importance[:, :expected_tokens]
     if token_importance.shape[-1] < expected_tokens:
         padding = expected_tokens - token_importance.shape[-1]
-        token_importance = torch.nn.functional.pad(token_importance, (0, padding))
-    attention_map = token_importance.view(token_importance.shape[0], temporal_tokens, spatial_tokens)
-    frame_importance = attention_map.mean(dim=-1)
+        token_importance = F.pad(token_importance, (0, padding))
+    attention_map = token_importance.view(batch_size, temporal_tokens, grid_h, grid_w)
+    frame_importance = attention_map.mean(dim=(2, 3))
     frame_importance = _normalize_scores(frame_importance)
     if temporal_tokens != num_frames:
-        frame_importance = torch.nn.functional.interpolate(
+        frame_importance = F.interpolate(
             frame_importance.unsqueeze(1),
             size=num_frames,
             mode="linear",
@@ -347,13 +396,14 @@ def classify_anomaly(frame_importance: torch.Tensor, attention_map: Optional[tor
     if attention_map is None:
         return "unknown"
 
-    spatial_var = float(attention_map.var().item())
     temporal_var = float(frame_importance.var().item())
+    spatial_var = float(attention_map.var().item()) if isinstance(attention_map, torch.Tensor) else 0.0
+    mean_importance = float(frame_importance.mean().item())
     if temporal_var > 0.1:
         return "movement anomaly"
     if spatial_var > 0.1:
         return "texture jitter"
-    if float(frame_importance.mean().item()) > 0.7:
+    if mean_importance > 0.7:
         return "lighting anomaly"
     return "object inconsistency"
 

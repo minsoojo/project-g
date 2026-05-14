@@ -171,6 +171,7 @@ def run_infer(args: argparse.Namespace) -> None:
         image_size=(args.image_size, args.image_size),
         return_xai=args.with_xai,
         xai_threshold=args.xai_threshold,
+        xai_output_dir=args.output_path.parent if args.output_path else Path("."),
     )
     print(json.dumps(payload))
     if args.output_path:
@@ -210,6 +211,7 @@ def run_infer_manifest(args: argparse.Namespace) -> None:
                 image_size=(args.image_size, args.image_size),
                 return_xai=args.with_xai,
                 xai_threshold=args.xai_threshold,
+                xai_output_dir=args.output_path.parent,
             )
             confidence = float(prediction["confidence"])
             predictions.append(

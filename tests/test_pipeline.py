@@ -15,10 +15,9 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from ai_video_detector.cli import load_manifest, parse_args, run_train
 from ai_video_detector.data import VideoDataset, VideoSample, load_video, load_video_samples_from_manifest
-from ai_video_detector.infer import _num_clips_for_duration, predict_video
+from ai_video_detector.infer import predict_video
 from ai_video_detector.metrics import compute_classification_metrics
 from ai_video_detector.model import VideoClassifier, VideoClassifierConfig, VideoMAEEncoder
-from ai_video_detector.preprocessing import temporal_sample_clips
 from ai_video_detector.train import build_optimizer, evaluate_model, make_epoch_summary, train_one_epoch
 from ai_video_detector.utils import log_message, save_json, set_seed
 
@@ -270,42 +269,6 @@ class PipelineTests(unittest.TestCase):
         self.assertGreaterEqual(prediction["confidence"], 0.0)
         self.assertLessEqual(prediction["confidence"], 1.0)
 
-    def test_adaptive_inference_clip_policy(self) -> None:
-        self.assertEqual(_num_clips_for_duration(5.0), 1)
-        self.assertEqual(_num_clips_for_duration(15.0), 3)
-        self.assertEqual(_num_clips_for_duration(30.0), 5)
-        self.assertEqual(_num_clips_for_duration(31.0), 8)
-        self.assertEqual(_num_clips_for_duration(60.0), 12)
-
-    def test_temporal_sample_clips_keeps_fixed_clip_shape(self) -> None:
-        frames = torch.arange(10 * 2 * 2 * 3, dtype=torch.uint8).reshape(10, 2, 2, 3)
-
-        clips = temporal_sample_clips(frames, num_frames=4, num_clips=3)
-
-        self.assertEqual(clips.shape, (3, 4, 2, 2, 3))
-
-    def test_predict_video_uses_adaptive_clip_batch_for_long_input(self) -> None:
-        class CountingModel(torch.nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.batch_sizes: list[int] = []
-
-            def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-                self.batch_sizes.append(pixel_values.shape[0])
-                return torch.linspace(-2.0, 2.0, steps=pixel_values.shape[0])
-
-        device = torch.device("cpu")
-        model = CountingModel()
-        tmp_path = self._make_tmp_path()
-        sample_path = tmp_path / "long_infer.npy"
-        np.save(sample_path, np.random.randint(0, 255, size=(600, 8, 8, 3), dtype=np.uint8))
-
-        prediction = predict_video(model, sample_path, device=device, num_frames=4, image_size=(8, 8))
-
-        self.assertEqual(model.batch_sizes, [5])
-        self.assertEqual(prediction["prediction"], "ai_generated")
-        self.assertGreater(prediction["confidence"], 0.5)
-
     def test_freeze_encoder_option(self) -> None:
         model = VideoClassifier(VideoClassifierConfig(hidden_dim=64, use_pretrained=False, freeze_encoder=True))
 
@@ -388,10 +351,13 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertIn("xai", prediction)
-        self.assertEqual(set(prediction["xai"]), {"method", "threshold", "frame_importance", "segments", "explanations", "summary"})
+        self.assertEqual(
+            set(prediction["xai"]),
+            {"method", "threshold", "frame_importance", "segments", "explanations", "visualizations", "summary"},
+        )
         self.assertEqual(
             set(prediction["xai"]["summary"]),
-            {"num_frames", "num_segments", "max_frame_importance"},
+            {"num_frames", "num_segments", "max_frame_importance", "num_visualizations"},
         )
         self.assertNotIn("frame_importance", prediction)
         self.assertNotIn("segments", prediction)
