@@ -89,6 +89,7 @@ class AnalyzerConfig:
     transformer_head_ff_dim: int = 2048
     num_frames: int = 16
     image_size: int = 224
+    max_clips: int = 8
     with_xai: bool = True
     xai_threshold: float = 0.6
     max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES
@@ -112,6 +113,7 @@ class AnalyzerConfig:
             transformer_head_ff_dim=_env_int(f"{prefix}_TRANSFORMER_HEAD_FF_DIM", cls.transformer_head_ff_dim),
             num_frames=_env_int(f"{prefix}_NUM_FRAMES", cls.num_frames),
             image_size=_env_int(f"{prefix}_IMAGE_SIZE", cls.image_size),
+            max_clips=_env_int(f"{prefix}_MAX_CLIPS", cls.max_clips),
             with_xai=_env_bool(f"{prefix}_WITH_XAI", cls.with_xai),
             xai_threshold=_env_float(f"{prefix}_XAI_THRESHOLD", cls.xai_threshold),
             max_download_bytes=_env_int(f"{prefix}_MAX_DOWNLOAD_BYTES", cls.max_download_bytes),
@@ -146,6 +148,7 @@ class ModelAnalyzer:
                 return_xai=self.config.with_xai,
                 xai_threshold=self.config.xai_threshold,
                 xai_output_dir=None,
+                max_clips=self.config.max_clips,
             )
             return self._format_response(result, temp_path, request_id=request_id)
         finally:

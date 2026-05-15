@@ -40,16 +40,24 @@ def temporal_sample_clips_with_indices(
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Sample multiple clips while preserving original frame indices."""
     total_frames = frames.shape[0]
+    clip_indices = temporal_sample_clip_indices(total_frames, num_frames, num_clips)
+    return torch.stack([frames[indices] for indices in clip_indices], dim=0), clip_indices
+
+
+def temporal_sample_clip_indices(
+    total_frames: int,
+    num_frames: int,
+    num_clips: int,
+) -> list[torch.Tensor]:
+    """Return sampled original frame indices for one or more temporal clips."""
     if total_frames == 0:
         raise ValueError("frames must contain at least one frame")
     if num_clips <= 0:
         raise ValueError("num_clips must be positive")
     if num_clips == 1:
-        sampled, indices = temporal_sample_with_indices(frames, num_frames)
-        return sampled.unsqueeze(0), [indices]
+        return [temporal_sample_indices(total_frames, num_frames)]
 
     boundaries = torch.linspace(0, total_frames, steps=num_clips + 1).round().long()
-    clips = []
     clip_indices = []
     for index in range(num_clips):
         start = int(boundaries[index].item())
@@ -58,9 +66,8 @@ def temporal_sample_clips_with_indices(
             start = min(start, total_frames - 1)
             end = start + 1
         indices = temporal_sample_indices(total_frames, num_frames, start=start, end=end)
-        clips.append(frames[indices])
         clip_indices.append(indices)
-    return torch.stack(clips, dim=0), clip_indices
+    return clip_indices
 
 
 def resize_frames(frames: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:

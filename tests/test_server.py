@@ -69,6 +69,7 @@ class ServerTests(unittest.TestCase):
             max_download_bytes = 1024
             num_frames = 4
             image_size = 8
+            max_clips = 8
             with_xai = False
             xai_threshold = 0.6
             max_heatmaps = 5

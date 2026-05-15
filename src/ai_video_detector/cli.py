@@ -57,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     infer_parser.add_argument("--image-size", type=int, default=224)
     infer_parser.add_argument("--with-xai", action="store_true")
     infer_parser.add_argument("--xai-threshold", type=float, default=0.6)
+    infer_parser.add_argument("--max-clips", type=int, default=8)
     infer_parser.add_argument("--no-pretrained", action="store_true")
     infer_parser.add_argument("--encoder-name", type=str, default=DEFAULT_ENCODER_NAME)
     infer_parser.add_argument("--freeze-encoder", action="store_true")
@@ -76,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     infer_manifest_parser.add_argument("--limit", type=int)
     infer_manifest_parser.add_argument("--with-xai", action="store_true")
     infer_manifest_parser.add_argument("--xai-threshold", type=float, default=0.6)
+    infer_manifest_parser.add_argument("--max-clips", type=int, default=8)
     infer_manifest_parser.add_argument("--no-pretrained", action="store_true")
     infer_manifest_parser.add_argument("--encoder-name", type=str, default=DEFAULT_ENCODER_NAME)
     infer_manifest_parser.add_argument("--freeze-encoder", action="store_true")
@@ -172,6 +174,7 @@ def run_infer(args: argparse.Namespace) -> None:
         return_xai=args.with_xai,
         xai_threshold=args.xai_threshold,
         xai_output_dir=args.output_path.parent if args.output_path else Path("."),
+        max_clips=args.max_clips,
     )
     print(json.dumps(payload))
     if args.output_path:
@@ -212,6 +215,7 @@ def run_infer_manifest(args: argparse.Namespace) -> None:
                 return_xai=args.with_xai,
                 xai_threshold=args.xai_threshold,
                 xai_output_dir=args.output_path.parent,
+                max_clips=args.max_clips,
             )
             confidence = float(prediction["confidence"])
             predictions.append(

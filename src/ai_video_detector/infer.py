@@ -12,10 +12,12 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .data import load_video
-from .preprocessing import normalize_frames, resize_frames, temporal_sample_clips_with_indices
+from .preprocessing import normalize_frames, resize_frames, temporal_sample_clip_indices, temporal_sample_clips_with_indices
 from .utils import save_json
 
 DEFAULT_FALLBACK_FPS = 30.0
+DEFAULT_MAX_CLIPS = 8
+STREAMING_VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv"}
 
 
 @torch.no_grad()
@@ -30,12 +32,12 @@ def predict_video(
     return_xai: bool = False,
     xai_threshold: float = 0.6,
     xai_output_dir: Optional[Union[str, Path]] = None,
+    max_clips: Optional[int] = DEFAULT_MAX_CLIPS,
 ) -> Dict[str, Any]:
     """Predict whether a single video is real or AI-generated."""
-    frames = torch.from_numpy(load_video(video_path))
-    timing = _read_video_timing(video_path, total_frames=frames.shape[0])
-    num_clips = _num_clips_for_duration(timing["duration_seconds"])
-    clips, clip_frame_indices = temporal_sample_clips_with_indices(frames, num_frames, num_clips)
+    clips, clip_frame_indices, timing, all_frames = _load_inference_clips(video_path, num_frames, max_clips)
+    total_frames = int(timing["total_frames"])
+    num_clips = len(clip_frame_indices)
     model.eval()
     if return_xai and hasattr(model, "predict_with_xai"):
         clip_logits = []
@@ -47,9 +49,12 @@ def predict_video(
             clip_logits.append(outputs["logits"].reshape(-1)[0])
         logits = torch.stack(clip_logits)
     else:
-        normalized = torch.stack([normalize_frames(resize_frames(clip, image_size), mean, std) for clip in clips], dim=0).to(device)
         clip_outputs = []
-        logits = model(normalized).reshape(-1)
+        clip_logits = []
+        for clip in clips:
+            normalized = _prepare_clip(clip, image_size, mean, std, device)
+            clip_logits.append(model(normalized).reshape(-1)[0])
+        logits = torch.stack(clip_logits)
 
     clip_scores = torch.sigmoid(logits.reshape(-1)).detach().cpu()
     representative_clip_index = int(torch.argmax(clip_scores).item())
@@ -62,9 +67,10 @@ def predict_video(
         "inference": {
             "duration_seconds": timing["duration_seconds"],
             "fps": timing["fps"],
-            "total_frames": int(frames.shape[0]),
+            "total_frames": total_frames,
             "num_frames_per_clip": int(num_frames),
             "num_clips": int(num_clips),
+            "max_clips": int(max_clips) if max_clips is not None else None,
             "video_score_strategy": "max_clip_confidence",
             "representative_clip_index": representative_clip_index,
         },
@@ -73,7 +79,8 @@ def predict_video(
     if return_xai and clip_outputs:
         representative_output = clip_outputs[representative_clip_index]
         representative_indices = clip_frame_indices[representative_clip_index]
-        visual_frames = resize_frames(frames[representative_indices], image_size).clone()
+        visual_source = clips[representative_clip_index] if all_frames is None else all_frames[representative_indices]
+        visual_frames = resize_frames(visual_source, image_size).clone()
         sampled_frames = _format_sampled_frames(representative_indices, timing["fps"])
         payload["xai"] = _format_xai_output(
             representative_output,
@@ -91,6 +98,29 @@ def predict_video(
             else [],
         )
     return payload
+
+
+def _load_inference_clips(
+    video_path: Union[str, Path],
+    num_frames: int,
+    max_clips: Optional[int],
+) -> Tuple[torch.Tensor, List[torch.Tensor], Dict[str, float], Optional[torch.Tensor]]:
+    metadata = _read_video_metadata(video_path)
+    source = Path(video_path)
+    if metadata is not None and source.suffix.lower() in STREAMING_VIDEO_SUFFIXES:
+        fps = metadata["fps"] or DEFAULT_FALLBACK_FPS
+        total_frames = int(metadata["total_frames"])
+        duration_seconds = float(total_frames / fps)
+        num_clips = _num_clips_for_duration(duration_seconds, max_clips=max_clips)
+        clip_frame_indices = temporal_sample_clip_indices(total_frames, num_frames, num_clips)
+        clips = _read_video_frames_at_indices(source, clip_frame_indices)
+        return clips, clip_frame_indices, _timing_payload(total_frames, fps), None
+
+    frames = torch.from_numpy(load_video(video_path))
+    timing = _read_video_timing(video_path, total_frames=frames.shape[0])
+    num_clips = _num_clips_for_duration(timing["duration_seconds"], max_clips=max_clips)
+    clips, clip_frame_indices = temporal_sample_clips_with_indices(frames, num_frames, num_clips)
+    return clips, clip_frame_indices, timing, frames
 
 
 def _prepare_clip(
@@ -188,12 +218,123 @@ def _save_anomaly_heatmaps(
     return saved
 
 
+def _read_video_frames_at_indices(source: Path, clip_frame_indices: List[torch.Tensor]) -> torch.Tensor:
+    try:
+        return _read_video_frames_at_indices_random_access(source, clip_frame_indices)
+    except Exception:
+        return _read_video_frames_at_indices_sequential(source, clip_frame_indices)
+
+
+def _read_video_frames_at_indices_random_access(source: Path, clip_frame_indices: List[torch.Tensor]) -> torch.Tensor:
+    try:
+        import cv2  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("OpenCV is required for memory-efficient video inference") from exc
+
+    ordered_indices = sorted({int(index.item()) for indices in clip_frame_indices for index in indices})
+    frames_by_index: Dict[int, torch.Tensor] = {}
+    capture = cv2.VideoCapture(str(source))
+    if not capture.isOpened():
+        capture.release()
+        raise OSError(f"Failed to load video '{source}': could not open file")
+    try:
+        for frame_index in ordered_indices:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            success, frame = capture.read()
+            if not success or frame is None:
+                raise ValueError(f"Failed to load video '{source}': could not read frame {frame_index}")
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames_by_index[frame_index] = torch.from_numpy(rgb.copy())
+    finally:
+        capture.release()
+
+    clips = []
+    for indices in clip_frame_indices:
+        clips.append(torch.stack([frames_by_index[int(index.item())] for index in indices], dim=0))
+    return torch.stack(clips, dim=0)
+
+
+def _read_video_frames_at_indices_sequential(source: Path, clip_frame_indices: List[torch.Tensor]) -> torch.Tensor:
+    try:
+        import cv2  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("OpenCV is required for memory-efficient video inference") from exc
+
+    requested = sorted({int(index.item()) for indices in clip_frame_indices for index in indices})
+    requested_set = set(requested)
+    max_requested = requested[-1]
+    frames_by_index: Dict[int, torch.Tensor] = {}
+    last_frame: Optional[torch.Tensor] = None
+    capture = cv2.VideoCapture(str(source))
+    if not capture.isOpened():
+        capture.release()
+        raise OSError(f"Failed to load video '{source}': could not open file")
+    try:
+        frame_index = 0
+        while frame_index <= max_requested:
+            success, frame = capture.read()
+            if not success or frame is None:
+                break
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            last_frame = torch.from_numpy(rgb.copy())
+            if frame_index in requested_set:
+                frames_by_index[frame_index] = last_frame
+            frame_index += 1
+    finally:
+        capture.release()
+
+    if last_frame is None:
+        raise ValueError(f"Failed to load video '{source}': decoded 0 frames")
+    for frame_index in requested:
+        frames_by_index.setdefault(frame_index, last_frame)
+
+    clips = []
+    for indices in clip_frame_indices:
+        clips.append(torch.stack([frames_by_index[int(index.item())] for index in indices], dim=0))
+    return torch.stack(clips, dim=0)
+
+
 def _read_video_timing(video_path: Union[str, Path], total_frames: int) -> Dict[str, float]:
-    fps = _read_fps_from_metadata(video_path) or DEFAULT_FALLBACK_FPS
+    metadata = _read_video_metadata(video_path)
+    fps = (metadata["fps"] if metadata else None) or DEFAULT_FALLBACK_FPS
+    return _timing_payload(total_frames, fps)
+
+
+def _timing_payload(total_frames: int, fps: float) -> Dict[str, float]:
     return {
         "fps": float(fps),
         "duration_seconds": float(total_frames / fps),
+        "total_frames": int(total_frames),
     }
+
+
+def _read_video_metadata(video_path: Union[str, Path]) -> Optional[Dict[str, float]]:
+    source = Path(video_path)
+    suffix = source.suffix.lower()
+    if suffix == ".gif":
+        try:
+            with Image.open(source) as image:
+                duration_ms = float(image.info.get("duration", 0.0))
+                frame_count = float(getattr(image, "n_frames", 0) or 0)
+            fps = 1000.0 / duration_ms if duration_ms > 0 else DEFAULT_FALLBACK_FPS
+            return {"fps": fps, "total_frames": frame_count} if frame_count > 0 else None
+        except Exception:
+            return None
+    if suffix in STREAMING_VIDEO_SUFFIXES:
+        try:
+            import cv2  # type: ignore
+
+            capture = cv2.VideoCapture(str(source))
+            try:
+                fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+                total_frames = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+            finally:
+                capture.release()
+            if total_frames <= 0:
+                return None
+            return {"fps": fps if fps > 0 else DEFAULT_FALLBACK_FPS, "total_frames": total_frames}
+        except Exception:
+            return None
 
 
 def _read_fps_from_metadata(video_path: Union[str, Path]) -> Optional[float]:
@@ -221,14 +362,16 @@ def _read_fps_from_metadata(video_path: Union[str, Path]) -> Optional[float]:
     return None
 
 
-def _num_clips_for_duration(duration_seconds: float) -> int:
+def _num_clips_for_duration(duration_seconds: float, max_clips: Optional[int] = DEFAULT_MAX_CLIPS) -> int:
     if duration_seconds <= 5:
-        return 1
-    if duration_seconds <= 15:
-        return 3
-    if duration_seconds <= 30:
-        return 5
-    return max(8, math.ceil(duration_seconds / 5))
+        clips = 1
+    elif duration_seconds <= 15:
+        clips = 3
+    elif duration_seconds <= 30:
+        clips = 5
+    else:
+        clips = max(8, math.ceil(duration_seconds / 5))
+    return min(clips, max_clips) if max_clips is not None else clips
 
 
 def _format_clip_predictions(
