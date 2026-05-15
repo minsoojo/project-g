@@ -17,7 +17,8 @@ from ai_video_detector.cli import load_manifest, parse_args, run_train
 from ai_video_detector.data import VideoDataset, VideoSample, load_video, load_video_samples_from_manifest
 from ai_video_detector.infer import predict_video
 from ai_video_detector.metrics import compute_classification_metrics
-from ai_video_detector.model import VideoClassifier, VideoClassifierConfig, VideoMAEEncoder
+from ai_video_detector.model import VideoClassifier, VideoClassifierConfig, VideoMAEEncoder, load_video_classifier_state_dict
+from ai_video_detector.preprocessing import temporal_sample_clips_with_indices
 from ai_video_detector.train import build_optimizer, evaluate_model, make_epoch_summary, train_one_epoch
 from ai_video_detector.utils import log_message, save_json, set_seed
 
@@ -264,16 +265,65 @@ class PipelineTests(unittest.TestCase):
         np.save(sample_path, np.random.randint(0, 255, size=(4, 8, 8, 3), dtype=np.uint8))
         prediction = predict_video(model, sample_path, device=device, num_frames=4, image_size=(8, 8))
 
-        self.assertEqual(set(prediction), {"prediction", "confidence"})
+        self.assertEqual(set(prediction), {"prediction", "confidence", "inference", "clip_predictions"})
         self.assertIn(prediction["prediction"], {"real", "ai_generated"})
         self.assertGreaterEqual(prediction["confidence"], 0.0)
         self.assertLessEqual(prediction["confidence"], 1.0)
+        self.assertEqual(prediction["inference"]["video_score_strategy"], "max_clip_confidence")
+
+    def test_adaptive_sampling_preserves_original_frame_indices(self) -> None:
+        frames = torch.arange(10 * 2 * 2 * 3, dtype=torch.uint8).reshape(10, 2, 2, 3)
+
+        clips, indices = temporal_sample_clips_with_indices(frames, num_frames=4, num_clips=3)
+
+        self.assertEqual(clips.shape, (3, 4, 2, 2, 3))
+        self.assertEqual(len(indices), 3)
+        self.assertEqual(indices[0].tolist()[0], 0)
+        self.assertTrue(all(0 <= value < 10 for clip in indices for value in clip.tolist()))
+        self.assertEqual(indices[-1].tolist()[-1], 9)
+
+    def test_predict_video_uses_max_confidence_clip_as_video_score(self) -> None:
+        class CountingModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.batch_sizes: list[int] = []
+
+            def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+                self.batch_sizes.append(pixel_values.shape[0])
+                return torch.tensor([-2.0, -1.0, 0.0, 3.0, 1.0])
+
+        device = torch.device("cpu")
+        model = CountingModel()
+        tmp_path = self._make_tmp_path()
+        sample_path = tmp_path / "long_infer.npy"
+        np.save(sample_path, np.random.randint(0, 255, size=(600, 8, 8, 3), dtype=np.uint8))
+
+        prediction = predict_video(model, sample_path, device=device, num_frames=4, image_size=(8, 8))
+
+        self.assertEqual(model.batch_sizes, [5])
+        self.assertEqual(prediction["inference"]["num_clips"], 5)
+        self.assertEqual(prediction["inference"]["representative_clip_index"], 3)
+        self.assertEqual(prediction["confidence"], prediction["clip_predictions"][3]["confidence"])
+        self.assertEqual(len(prediction["clip_predictions"][3]["sampled_frames"]), 4)
 
     def test_freeze_encoder_option(self) -> None:
         model = VideoClassifier(VideoClassifierConfig(hidden_dim=64, use_pretrained=False, freeze_encoder=True))
 
         self.assertTrue(all(not parameter.requires_grad for parameter in model.encoder.parameters()))
         self.assertTrue(all(parameter.requires_grad for parameter in model.classifier.parameters()))
+
+    def test_load_video_classifier_state_dict_accepts_legacy_mlp_head_keys(self) -> None:
+        source = VideoClassifier(VideoClassifierConfig(hidden_dim=64, use_pretrained=False))
+        state_dict = source.state_dict()
+        legacy_state_dict = {}
+        for key, value in state_dict.items():
+            legacy_key = key.replace("classifier.layers.", "classifier.")
+            legacy_state_dict[legacy_key] = value
+        target = VideoClassifier(VideoClassifierConfig(hidden_dim=64, use_pretrained=False))
+
+        load_video_classifier_state_dict(target, legacy_state_dict)
+
+        self.assertTrue(torch.equal(target.state_dict()["classifier.layers.0.weight"], state_dict["classifier.layers.0.weight"]))
 
     def test_transformer_head_forward_with_fallback_encoder(self) -> None:
         model = VideoClassifier(
@@ -353,8 +403,23 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("xai", prediction)
         self.assertEqual(
             set(prediction["xai"]),
-            {"method", "threshold", "frame_importance", "segments", "explanations", "visualizations", "summary"},
+            {
+                "method",
+                "threshold",
+                "scope",
+                "clip_index",
+                "frame_importance_scope",
+                "frame_importance",
+                "sampled_frames",
+                "segments",
+                "explanations",
+                "visualizations",
+                "summary",
+            },
         )
+        self.assertEqual(prediction["xai"]["scope"], "representative_clip")
+        self.assertEqual(prediction["xai"]["frame_importance_scope"], "clip_sampled_frame_index")
+        self.assertEqual(prediction["xai"]["sampled_frames"][0]["original_frame_index"], 0)
         self.assertEqual(
             set(prediction["xai"]["summary"]),
             {"num_frames", "num_segments", "max_frame_importance", "num_visualizations"},

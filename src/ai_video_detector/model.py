@@ -261,6 +261,26 @@ class VideoClassifier(nn.Module):
         return self.classifier(encoded.features)
 
 
+def load_video_classifier_state_dict(model: VideoClassifier, state_dict: Dict[str, torch.Tensor]) -> None:
+    """Load checkpoints from both current and legacy classifier key layouts."""
+    model.load_state_dict(_normalize_classifier_state_dict_keys(state_dict))
+
+
+def _normalize_classifier_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    if "classifier.0.weight" not in state_dict or "classifier.layers.0.weight" in state_dict:
+        return state_dict
+
+    normalized = dict(state_dict)
+    for suffix in ("weight", "bias"):
+        legacy_first = f"classifier.0.{suffix}"
+        legacy_output = f"classifier.3.{suffix}"
+        if legacy_first in normalized:
+            normalized[f"classifier.layers.0.{suffix}"] = normalized.pop(legacy_first)
+        if legacy_output in normalized:
+            normalized[f"classifier.layers.3.{suffix}"] = normalized.pop(legacy_output)
+    return normalized
+
+
 def _normalize_scores(scores: torch.Tensor) -> torch.Tensor:
     minimum = scores.min(dim=-1, keepdim=True).values
     maximum = scores.max(dim=-1, keepdim=True).values

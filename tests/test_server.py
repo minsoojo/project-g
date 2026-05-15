@@ -121,6 +121,11 @@ class ServerTests(unittest.TestCase):
                 "confidence": 0.91,
                 "xai": {
                     "frame_importance": [0.12, 0.88, 0.76],
+                    "sampled_frames": [
+                        {"sampled_frame_index": 0, "original_frame_index": 0, "timestamp_sec": 0.0},
+                        {"sampled_frame_index": 1, "original_frame_index": 2, "timestamp_sec": 0.2},
+                        {"sampled_frame_index": 2, "original_frame_index": 1, "timestamp_sec": 0.1},
+                    ],
                     "segments": [{"start_frame": 1, "end_frame": 2, "type": "movement anomaly", "confidence": 0.82}],
                     "explanations": ["Frames 1 to 2 show movement anomaly."],
                     "method": "attention_rollup",
@@ -131,8 +136,10 @@ class ServerTests(unittest.TestCase):
         )
 
         self.assertEqual(result.decision, "FAKE")
+        self.assertEqual(result.evidence.sampled_frames[1]["original_frame_index"], 2)
         self.assertEqual(result.xai_visualization.method, "attention_rollout")
         self.assertEqual(len(result.xai_visualization.heatmaps), 2)
+        self.assertEqual(result.xai_visualization.heatmaps[0].original_frame_index, 2)
         for heatmap in result.xai_visualization.heatmaps:
             self.assertTrue((tmp_path / heatmap.heatmap_url.lstrip("/")).exists())
             self.assertTrue((tmp_path / heatmap.overlay_url.lstrip("/")).exists())

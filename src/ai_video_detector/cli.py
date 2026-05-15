@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from .data import VideoDataset, VideoSample, load_video_samples_from_manifest
 from .infer import predict_video
 from .metrics import compute_classification_metrics
-from .model import VideoClassifier, VideoClassifierConfig
+from .model import VideoClassifier, VideoClassifierConfig, load_video_classifier_state_dict
 from .train import build_optimizer, evaluate_model, make_epoch_summary, save_checkpoint, save_epoch_summary, train_one_epoch
 from .utils import set_seed
 
@@ -162,7 +162,7 @@ def run_infer(args: argparse.Namespace) -> None:
     )
     model = VideoClassifier(config).to(device)
     state_dict = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(state_dict)
+    load_video_classifier_state_dict(model, state_dict)
     payload = predict_video(
         model,
         args.video_path,
@@ -191,7 +191,7 @@ def run_infer_manifest(args: argparse.Namespace) -> None:
     )
     model = VideoClassifier(config).to(device)
     state_dict = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(state_dict)
+    load_video_classifier_state_dict(model, state_dict)
 
     samples = load_manifest(args.manifest, data_root=args.data_root, split=args.split)
     if args.limit is not None:

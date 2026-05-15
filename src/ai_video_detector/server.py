@@ -21,8 +21,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from .data import load_video
 from .infer import predict_video
-from .model import VideoClassifier, VideoClassifierConfig
-from .preprocessing import temporal_sample
+from .model import VideoClassifier, VideoClassifierConfig, load_video_classifier_state_dict
 
 
 DEFAULT_MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
@@ -48,12 +47,17 @@ class AnalyzeRequest(BaseModel):
 
 class Evidence(BaseModel):
     frame_importance: List[float]
+    sampled_frames: List[Dict[str, Any]] = Field(default_factory=list)
     segments: List[Dict[str, Any]]
     explanations: List[str]
+    clip_predictions: List[Dict[str, Any]] = Field(default_factory=list)
+    representative_clip: Optional[Dict[str, Any]] = None
 
 
 class HeatmapInfo(BaseModel):
     frame_idx: int
+    original_frame_index: Optional[int] = None
+    timestamp_sec: Optional[float] = None
     importance: float
     focus_area: List[str]
     heatmap_url: str
@@ -141,6 +145,7 @@ class ModelAnalyzer:
                 image_size=(self.config.image_size, self.config.image_size),
                 return_xai=self.config.with_xai,
                 xai_threshold=self.config.xai_threshold,
+                xai_output_dir=None,
             )
             return self._format_response(result, temp_path, request_id=request_id)
         finally:
@@ -156,16 +161,25 @@ class ModelAnalyzer:
         t2v_prob = float(result["confidence"])
         xai = result.get("xai", {})
         frame_importance = [float(value) for value in result.get("frame_importance", xai.get("frame_importance", []))]
+        sampled_frames = list(xai.get("sampled_frames", []))
         method = str(result.get("xai_method", xai.get("method", "none")))
-        heatmaps = self._build_heatmaps(video_path, frame_importance, request_id=request_id)
+        heatmaps = self._build_heatmaps(
+            video_path,
+            frame_importance,
+            sampled_frames=sampled_frames,
+            request_id=request_id,
+        )
         return AnalyzeResponse(
             decision="FAKE" if t2v_prob >= 0.5 else "REAL",
             t2v_prob=t2v_prob,
             model_used=self.config.model_used,
             evidence=Evidence(
                 frame_importance=frame_importance,
+                sampled_frames=sampled_frames,
                 segments=list(result.get("segments", xai.get("segments", []))),
                 explanations=list(result.get("explanations", xai.get("explanations", []))),
+                clip_predictions=list(result.get("clip_predictions", [])),
+                representative_clip=_representative_clip(result),
             ),
             xai_visualization=XAIVisualization(
                 method=_normalize_xai_method(method),
@@ -178,13 +192,13 @@ class ModelAnalyzer:
         video_path: Path,
         frame_importance: List[float],
         *,
+        sampled_frames: Optional[List[Dict[str, Any]]] = None,
         request_id: Optional[str],
     ) -> List[HeatmapInfo]:
         if not frame_importance:
             return []
 
         frames = torch.from_numpy(load_video(video_path))
-        sampled = temporal_sample(frames, len(frame_importance)).numpy()
         selected_indices = _top_frame_indices(frame_importance, self.config.max_heatmaps, self.config.xai_threshold)
         if not selected_indices:
             return []
@@ -198,13 +212,18 @@ class ModelAnalyzer:
         heatmaps: List[HeatmapInfo] = []
         for frame_idx in selected_indices:
             importance = float(frame_importance[frame_idx])
-            frame = _uint8_frame(sampled[frame_idx])
-            heatmap_path = heatmap_dir / f"{video_key}_frame{frame_idx}.jpg"
-            overlay_path = overlay_dir / f"{video_key}_frame{frame_idx}.jpg"
+            frame_meta = _sampled_frame_meta(sampled_frames or [], frame_idx)
+            original_frame_index = int(frame_meta.get("original_frame_index", frame_idx))
+            original_frame_index = max(0, min(original_frame_index, frames.shape[0] - 1))
+            frame = _uint8_frame(frames[original_frame_index].numpy())
+            heatmap_path = heatmap_dir / f"{video_key}_frame{original_frame_index}.jpg"
+            overlay_path = overlay_dir / f"{video_key}_frame{original_frame_index}.jpg"
             _save_heatmap_images(frame, importance, heatmap_path, overlay_path)
             heatmaps.append(
                 HeatmapInfo(
                     frame_idx=frame_idx,
+                    original_frame_index=original_frame_index,
+                    timestamp_sec=frame_meta.get("timestamp_sec"),
                     importance=importance,
                     focus_area=[],
                     heatmap_url=f"/xai/heatmaps/{heatmap_path.name}",
@@ -230,7 +249,7 @@ class ModelAnalyzer:
         )
         model = VideoClassifier(model_config).to(self.device)
         state_dict = torch.load(self.config.checkpoint_path, map_location=self.device)
-        model.load_state_dict(state_dict)
+        load_video_classifier_state_dict(model, state_dict)
         model.eval()
         self.model = model
         return model
@@ -301,6 +320,24 @@ def _top_frame_indices(frame_importance: List[float], max_items: int, threshold:
     above_threshold = [index for index in ranked if frame_importance[index] >= threshold]
     selected = above_threshold or ranked[:1]
     return sorted(selected[:max_items])
+
+
+def _sampled_frame_meta(sampled_frames: List[Dict[str, Any]], sampled_frame_index: int) -> Dict[str, Any]:
+    for frame in sampled_frames:
+        if int(frame.get("sampled_frame_index", -1)) == sampled_frame_index:
+            return frame
+    return {"sampled_frame_index": sampled_frame_index, "original_frame_index": sampled_frame_index, "timestamp_sec": None}
+
+
+def _representative_clip(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    inference = result.get("inference", {})
+    clip_index = inference.get("representative_clip_index")
+    if clip_index is None:
+        return None
+    for clip in result.get("clip_predictions", []):
+        if clip.get("clip_index") == clip_index:
+            return clip
+    return None
 
 
 def _safe_file_key(value: str) -> str:
