@@ -14,7 +14,13 @@ from ai_video_detector.server import AnalyzeResponse, Evidence, ModelAnalyzer, X
 class StubAnalyzer:
     name = "t2v"
 
-    def analyze_url(self, url: str, *, request_id: str | None = None) -> AnalyzeResponse:
+    def analyze_url(
+        self,
+        url: str,
+        *,
+        request_id: str | None = None,
+        return_xai: bool | None = None,
+    ) -> AnalyzeResponse:
         return AnalyzeResponse(
             decision="REAL",
             t2v_prob=0.25,
@@ -51,6 +57,54 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(payload["evidence"]["frame_importance"], [0.25])
         self.assertEqual(payload["xai_visualization"]["method"], "attention_rollout")
 
+    def test_t2v_analyze_accepts_video_url_payload(self) -> None:
+        app.dependency_overrides[get_t2v_analyzer] = lambda: StubAnalyzer()
+        try:
+            client = TestClient(app)
+            response = client.post(
+                "/t2v/analyze",
+                json={
+                    "video_url": "https://bucket.s3.ap-northeast-2.amazonaws.com/input.mp4?signature=test",
+                    "return_xai": True,
+                },
+            )
+        finally:
+            app.dependency_overrides.clear()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["decision"], "REAL")
+
+    def test_t2v_analyze_passes_return_xai_flag(self) -> None:
+        class CapturingAnalyzer(StubAnalyzer):
+            return_xai = None
+
+            def analyze_url(
+                self,
+                url: str,
+                *,
+                request_id: str | None = None,
+                return_xai: bool | None = None,
+            ) -> AnalyzeResponse:
+                self.return_xai = return_xai
+                return super().analyze_url(url, request_id=request_id, return_xai=return_xai)
+
+        analyzer = CapturingAnalyzer()
+        app.dependency_overrides[get_t2v_analyzer] = lambda: analyzer
+        try:
+            client = TestClient(app)
+            response = client.post(
+                "/t2v/analyze",
+                json={
+                    "video_url": "https://bucket.s3.ap-northeast-2.amazonaws.com/input.mp4",
+                    "return_xai": False,
+                },
+            )
+        finally:
+            app.dependency_overrides.clear()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(analyzer.return_xai)
+
     def test_t2v_analyze_rejects_non_http_url(self) -> None:
         app.dependency_overrides[get_t2v_analyzer] = lambda: StubAnalyzer()
         try:
@@ -85,18 +139,22 @@ class ServerTests(unittest.TestCase):
             destination.write_bytes(b"video")
             created_paths.append(destination)
 
+        captured_kwargs = {}
+
         def fake_predict_video(model, video_path, **kwargs):
             self.assertTrue(video_path.exists())
+            captured_kwargs.update(kwargs)
             return {"prediction": "ai_generated", "confidence": 0.8}
 
         with patch("ai_video_detector.server.download_url", fake_download), patch(
             "ai_video_detector.server.predict_video",
             fake_predict_video,
         ), patch.object(analyzer, "_load_model", lambda: analyzer.model):
-            result = analyzer.analyze_url("https://example.com/video.gif")
+            result = analyzer.analyze_url("https://example.com/video.gif", return_xai=False)
 
         self.assertEqual(result.decision, "FAKE")
         self.assertEqual(result.t2v_prob, 0.8)
+        self.assertFalse(captured_kwargs["return_xai"])
         self.assertTrue(created_paths)
         self.assertFalse(created_paths[0].exists())
 

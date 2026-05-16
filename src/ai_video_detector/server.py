@@ -17,7 +17,7 @@ import torch
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, model_validator
 
 from .data import load_video
 from .infer import predict_video
@@ -31,18 +31,23 @@ SUPPORTED_DOWNLOAD_SCHEMES = {"http", "https"}
 class AnalyzeRequest(BaseModel):
     """Request payload sent by the backend after uploading a video to S3."""
 
-    s3_url: str = Field(..., description="S3 or presigned S3 URL for the video file")
+    s3_url: Optional[str] = Field(default=None, description="S3 or presigned S3 URL for the video file")
+    video_url: Optional[str] = Field(default=None, description="Alias for s3_url")
+    return_xai: Optional[bool] = Field(default=None, description="Whether to include XAI evidence and heatmaps")
     request_id: Optional[str] = Field(default=None, description="Optional caller-side request id")
 
-    @field_validator("s3_url")
-    @classmethod
-    def validate_s3_url(cls, value: str) -> str:
-        parsed = urllib.parse.urlparse(value)
+    @model_validator(mode="after")
+    def normalize_video_url(self) -> "AnalyzeRequest":
+        url = self.s3_url or self.video_url
+        if not url:
+            raise ValueError("Either s3_url or video_url is required")
+        parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in SUPPORTED_DOWNLOAD_SCHEMES:
-            raise ValueError("s3_url must be an http or https URL")
+            raise ValueError("s3_url/video_url must be an http or https URL")
         if not parsed.netloc:
-            raise ValueError("s3_url must include a host")
-        return value
+            raise ValueError("s3_url/video_url must include a host")
+        self.s3_url = url
+        return self
 
 
 class Evidence(BaseModel):
@@ -132,20 +137,27 @@ class ModelAnalyzer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model: Optional[torch.nn.Module] = None
 
-    def analyze_url(self, url: str, *, request_id: Optional[str] = None) -> AnalyzeResponse:
+    def analyze_url(
+        self,
+        url: str,
+        *,
+        request_id: Optional[str] = None,
+        return_xai: Optional[bool] = None,
+    ) -> AnalyzeResponse:
         model = self._load_model()
         suffix = _suffix_from_url(url)
         with tempfile.NamedTemporaryFile(prefix=f"{self.name}_", suffix=suffix, delete=False) as handle:
             temp_path = Path(handle.name)
         try:
             download_url(url, temp_path, max_bytes=self.config.max_download_bytes)
+            should_return_xai = self.config.with_xai if return_xai is None else return_xai
             result = predict_video(
                 model,
                 temp_path,
                 device=self.device,
                 num_frames=self.config.num_frames,
                 image_size=(self.config.image_size, self.config.image_size),
-                return_xai=self.config.with_xai,
+                return_xai=should_return_xai,
                 xai_threshold=self.config.xai_threshold,
                 xai_output_dir=None,
                 max_clips=self.config.max_clips,
@@ -274,7 +286,7 @@ def create_app() -> FastAPI:
         analyzer: ModelAnalyzer = Depends(get_t2v_analyzer),
     ) -> AnalyzeResponse:
         try:
-            return analyzer.analyze_url(request.s3_url, request_id=request.request_id)
+            return analyzer.analyze_url(str(request.s3_url), request_id=request.request_id, return_xai=request.return_xai)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
 
